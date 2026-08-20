@@ -436,6 +436,25 @@ class CacheAndDependencyTests(unittest.TestCase):
                 ["Whisper Tiny", "Whisper Small", "PhoWhisper Base"],
             )
 
+    def test_final_table_validation_rejects_any_blank_submission_cell(self):
+        funcs = load_functions("_validate_required_final_rows")
+        required_fields = ["VN WER (%) ↓", "Noise ΔWER @0dB (pp) ↓", "Peak RAM on S24 (MB) ↓"]
+        rows = [
+            {
+                "Model": "Whisper Tiny",
+                "VN WER (%) ↓": 10.0,
+                "Noise ΔWER @0dB (pp) ↓": np.nan,
+                "Peak RAM on S24 (MB) ↓": 100.0,
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "Whisper Tiny.*Noise ΔWER"):
+            funcs["_validate_required_final_rows"](
+                rows,
+                ["Whisper Tiny"],
+                required_fields,
+            )
+
     def test_corrupt_json_cache_is_quarantined(self):
         funcs = load_functions("_safe_json_load")
         with tempfile.TemporaryDirectory() as tmp_dir:

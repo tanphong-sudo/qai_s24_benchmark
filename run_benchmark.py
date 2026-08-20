@@ -42,7 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-required-s24-profile-v6"
+PATCH_VERSION = "2026-08-20-complete-table-guard-v7"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = os.environ.get("QAI_RUN_MODE", "benchmark").strip().lower()
@@ -1152,6 +1152,27 @@ def _validate_required_profile_rows(rows, required_models):
             "Required S24 latency/RAM profiling is incomplete: " + "; ".join(missing)
         )
 
+def _validate_required_final_rows(rows, required_models, required_fields):
+    rows_by_model={row.get("Model"):row for row in rows}
+    missing=[]
+    for model in required_models:
+        row=rows_by_model.get(model)
+        if row is None:
+            missing.append(f"{model}: final table row")
+            continue
+        for field in required_fields:
+            value=row.get(field)
+            try:
+                valid=value is not None and bool(np.isfinite(float(value)))
+            except (TypeError,ValueError):
+                valid=False
+            if not valid:
+                missing.append(f"{model}: {field}")
+    if missing:
+        raise RuntimeError(
+            "Final benchmark table has missing required values: " + "; ".join(missing)
+        )
+
 PROFILE_ROWS=[]
 for label,a in MODEL_ARTIFACTS.items():
     artifact_mode=a["artifact_mode"]
@@ -1936,6 +1957,19 @@ final=final.reset_index()
 # Human-readable rounding; raw detailed files remain available in results/.
 for c in final.columns:
     if c!="Model":final[c]=pd.to_numeric(final[c],errors="coerce").round(2)
+FINAL_REQUIRED_FIELDS=[
+    "VN WER (%) ↓",
+    "EN WER (%) ↓",
+    "North WER (%) ↓",
+    "Central WER (%) ↓",
+    "South WER (%) ↓",
+    "Noise ΔWER @0dB (pp) ↓",
+    "Code-switch CS-WER (%) ↓",
+    "S24 Encoder (ms) ↓",
+    "S24 Decoder/token (ms) ↓",
+    "Peak RAM on S24 (MB) ↓",
+]
+_validate_required_final_rows(final.to_dict("records"),list(MODEL_IDS),FINAL_REQUIRED_FIELDS)
 FINAL_TABLE_PATH=RESULT_DIR/"FINAL_BENCHMARK_TABLE.csv"
 final.to_csv(FINAL_TABLE_PATH,index=False)
 # Convenience copy: one obvious file at WORK_ROOT for Drive upload / submission.

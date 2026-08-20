@@ -49,3 +49,4 @@ Toàn bộ QNN artifact cache, profile data và per-sample checkpoint nằm tron
 - Trước khi tạo Qualcomm job, launcher chạy `pip check`, syntax check và regression preflight.
 - Nếu artifact cũ có producer đã `FAILED`, script tự loại cache đó và compile lại QNN DLC thay vì dùng model hỏng.
 - Profile và inference job lỗi đều được thử lại tối đa 3 lần. Benchmark chỉ báo hoàn thành khi cả 3 model có đủ encoder latency, decoder latency/token và Peak RAM; nếu vẫn lỗi, console ghi status/URL và lần chạy sau tiếp tục dùng artifact/checkpoint đã hoàn thành.
+- Trước khi tạo ZIP, script kiểm tra toàn bộ ô VN/EN WER, Bắc/Trung/Nam WER, noise ΔWER, code-switch CS-WER, S24 latency và Peak RAM của cả 3 model; thiếu bất kỳ số nào thì không báo hoàn thành.
