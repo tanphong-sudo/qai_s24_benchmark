@@ -42,6 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
+PATCH_VERSION = "2026-08-20-linked-iospec-fallback-v1"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = "benchmark"       # "smoke", "benchmark", or "full"
@@ -138,6 +139,7 @@ def append_job_evidence(record: dict):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+print("run_benchmark patch:", PATCH_VERSION)
 print({
     "run_mode": RUN_MODE,
     "benchmark_n": BENCHMARK_N,
@@ -574,14 +576,64 @@ def export_whisper_components(label: str, repo: str):
     gc.collect()
     return meta
 
-def inspect_linked_contract(model, graph_names: list[str]):
-    missing=set(graph_names)-set(model.input_spec)
-    if missing: raise RuntimeError(f"Linked binary is missing expected graphs {missing}; got {list(model.input_spec)}")
+@dataclass(frozen=True)
+class _LocalTensorSpec:
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+
+def _normalize_compile_input_spec(spec: Any) -> list[_LocalTensorSpec]:
+    """Normalize qai-hub-models compile InputSpec into TensorSpec-like rows.
+
+    Qualcomm Workbench normally exposes Model.input_spec for linked multi-graph
+    context binaries, but some client/server combinations return an empty IOSpec.
+    The exact compile input spec is still authoritative because it was submitted
+    with submit_compile_and_link_jobs().
+    """
+    out=[]
+    if isinstance(spec, dict):
+        items=list(spec.items())
+    elif isinstance(spec, (list, tuple)):
+        items=[(getattr(v, "name", None), v) for v in spec]
+    else:
+        raise TypeError(f"Unsupported compile input spec type: {type(spec)}")
+    for key, value in items:
+        name=str(getattr(value, "name", None) or key)
+        if hasattr(value, "shape"):
+            shape=tuple(int(x) for x in value.shape)
+            dtype=str(getattr(value, "dtype", "float32"))
+        elif isinstance(value, (tuple, list)) and len(value)==2 and isinstance(value[0], (tuple, list)) and isinstance(value[1], str):
+            shape=tuple(int(x) for x in value[0]); dtype=str(value[1])
+        else:
+            shape=tuple(int(x) for x in value); dtype="float32"
+        out.append(_LocalTensorSpec(name=name, shape=shape, dtype=dtype))
+    return out
+
+def inspect_linked_contract(model, cached: dict):
+    graph_names=cached["graph_names"]
     rows=[]
-    for graph in graph_names:
-        for side,specs in [("input",model.input_spec[graph]),("output",model.output_spec[graph])]:
-            for t in specs:
-                rows.append({"graph":graph,"side":side,"name":t.name,"shape":tuple(t.shape),"dtype":str(t.dtype)})
+    remote_inputs=getattr(model, "input_spec", {}) or {}
+    remote_outputs=getattr(model, "output_spec", {}) or {}
+    for idx,graph in enumerate(graph_names):
+        local_input = cached["encoder_input_spec"] if idx==0 else cached["decoder_input_spec"]
+        local_outputs = cached["encoder_output_names"] if idx==0 else cached["decoder_output_names"]
+        in_specs=remote_inputs.get(graph) or _normalize_compile_input_spec(local_input)
+        for t in in_specs:
+            rows.append({"graph":graph,"side":"input","name":t.name,"shape":tuple(t.shape),"dtype":str(t.dtype),
+                         "contract_source":"workbench_model_spec" if remote_inputs.get(graph) else "submitted_compile_spec"})
+        out_specs=remote_outputs.get(graph) or []
+        if out_specs:
+            for t in out_specs:
+                rows.append({"graph":graph,"side":"output","name":t.name,"shape":tuple(t.shape),"dtype":str(t.dtype),
+                             "contract_source":"workbench_model_spec"})
+        else:
+            for name in local_outputs:
+                rows.append({"graph":graph,"side":"output","name":str(name),"shape":None,"dtype":None,
+                             "contract_source":"submitted_output_names"})
+    if not remote_inputs:
+        print("NOTE: Workbench returned empty linked input_spec; using the exact input specs submitted at compile time for local validation.")
+    if not remote_outputs:
+        print("NOTE: Workbench returned empty linked output_spec; using the exact --output_names submitted at compile time.")
     return pd.DataFrame(rows)
 
 REMOTE_MANIFEST_PATH=ARTIFACT_DIR/"hub_artifacts.json"
@@ -673,7 +725,7 @@ for label,repo in MODEL_IDS.items():
     cached["producer_device"] = producer_device.name
     cached["linked_model_type"] = str(getattr(linked, "model_type", ""))
     cached["linked_model_metadata"] = {str(k): str(v) for k,v in (getattr(linked, "metadata", {}) or {}).items()}
-    contract=inspect_linked_contract(linked,cached["graph_names"])
+    contract=inspect_linked_contract(linked,cached)
     display(contract)
     MODEL_ARTIFACTS[label]={**cached,"linked_model":linked}
 
@@ -764,8 +816,35 @@ def np_dtype_from_hub(dtype: Any):
         if key in s:return d
     raise TypeError(f"Unsupported Workbench tensor dtype: {dtype}")
 
-def graph_specs(model,graph,side="input"):
-    return (model.input_spec if side=="input" else model.output_spec)[graph]
+GRAPH_CONTRACTS={}
+for _label,_a in MODEL_ARTIFACTS.items():
+    _enc_graph,_dec_graph=_a["graph_names"]
+    GRAPH_CONTRACTS[_enc_graph]={
+        "inputs":_normalize_compile_input_spec(_a["encoder_input_spec"]),
+        "outputs":list(_a["encoder_output_names"]),
+    }
+    GRAPH_CONTRACTS[_dec_graph]={
+        "inputs":_normalize_compile_input_spec(_a["decoder_input_spec"]),
+        "outputs":list(_a["decoder_output_names"]),
+    }
+
+def graph_input_specs(model,graph):
+    remote=getattr(model,"input_spec",{}) or {}
+    specs=remote.get(graph)
+    if specs:
+        return list(specs)
+    if graph not in GRAPH_CONTRACTS:
+        raise KeyError(f"No local compile contract for graph {graph!r}")
+    return GRAPH_CONTRACTS[graph]["inputs"]
+
+def graph_output_names(model,graph):
+    remote=getattr(model,"output_spec",{}) or {}
+    specs=remote.get(graph)
+    if specs:
+        return [t.name for t in specs]
+    if graph not in GRAPH_CONTRACTS:
+        raise KeyError(f"No local compile contract for graph {graph!r}")
+    return GRAPH_CONTRACTS[graph]["outputs"]
 
 def cast_for_tensor(arr: np.ndarray, ts):
     x=np.asarray(arr,dtype=np_dtype_from_hub(ts.dtype))
@@ -776,7 +855,7 @@ def cast_for_tensor(arr: np.ndarray, ts):
 
 def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_name: str):
     if not examples: return [],0.0,None
-    ins=graph_specs(model,graph,"input")
+    ins=graph_input_specs(model,graph)
     expected_names=[t.name for t in ins]
     for ex in examples:
         if set(ex)!=set(expected_names):
@@ -803,17 +882,17 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
         "qairt_api_version": QAIRT_VERSION,
         "wall_seconds": wall,
     })
-    outs=graph_specs(model,graph,"output")
-    missing=[t.name for t in outs if t.name not in raw]
+    out_names=graph_output_names(model,graph)
+    missing=[name for name in out_names if name not in raw]
     if missing:
         raise RuntimeError(f"Workbench output-name contract changed for {graph}; missing {missing}; returned {list(raw)}")
     k=len(examples)
     per_example=[]
     for i in range(k):
         row=[]
-        for t in outs:
-            vals=raw[t.name]
-            if len(vals)!=k: raise RuntimeError(f"Output {t.name} returned {len(vals)} entries for {k} inputs")
+        for name in out_names:
+            vals=raw[name]
+            if len(vals)!=k: raise RuntimeError(f"Output {name} returned {len(vals)} entries for {k} inputs")
             row.append(np.asarray(vals[i]))
         per_example.append(row)
     return per_example,wall,job.job_id
@@ -839,11 +918,11 @@ class S24WhisperRuntime:
         self.config=WhisperConfig.from_pretrained(self.snapshot)
         self.enc_out_names=self.a["encoder_output_names"]
         self.dec_out_names=self.a["decoder_output_names"]
-        if [t.name for t in graph_specs(self.model,self.enc_graph,"output")] != self.enc_out_names:
+        if graph_output_names(self.model,self.enc_graph) != self.enc_out_names:
             raise RuntimeError("Encoder target output order/names differ from Qualcomm source contract")
-        if [t.name for t in graph_specs(self.model,self.dec_graph,"output")] != self.dec_out_names:
+        if graph_output_names(self.model,self.dec_graph) != self.dec_out_names:
             raise RuntimeError("Decoder target output order/names differ from Qualcomm source contract")
-        self.dec_input_spec={t.name:t for t in graph_specs(self.model,self.dec_graph,"input")}
+        self.dec_input_spec={t.name:t for t in graph_input_specs(self.model,self.dec_graph)}
 
     def forced_prompt(self,language: str):
         fn=getattr(self.processor,"get_decoder_prompt_ids",None) or getattr(self.processor.tokenizer,"get_decoder_prompt_ids",None)
