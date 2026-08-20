@@ -310,10 +310,50 @@ def atomic_csv(df: pd.DataFrame, path: Path):
     df.to_csv(tmp, index=False)
     tmp.replace(path)
 
+def _json_default(obj: Any):
+    # Qualcomm qai-hub-models input specs contain TensorSpec objects, which are
+    # runtime objects and are not JSON-serializable by Python's default encoder.
+    # The manifest only needs a stable audit/cache representation; the real
+    # TensorSpec objects are reconstructed from the pinned model on reuse.
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj)
+
+    if obj.__class__.__name__ == "TensorSpec":
+        value = {"__type__": "TensorSpec"}
+        for attr in ("name", "shape", "dtype"):
+            if hasattr(obj, attr):
+                v = getattr(obj, attr)
+                if attr == "shape":
+                    try:
+                        v = list(v)
+                    except TypeError:
+                        v = str(v)
+                elif attr == "dtype":
+                    v = str(v)
+                value[attr] = v
+        value["repr"] = repr(obj)
+        return value
+
+    # Evidence/cache JSON must never abort a successful Qualcomm job merely
+    # because an SDK object gained a non-JSON field in a newer release.
+    return repr(obj)
+
 def atomic_json(obj: Any, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+    payload = json.dumps(
+        obj,
+        indent=2,
+        ensure_ascii=False,
+        default=_json_default,
+    )
+    tmp.write_text(payload, encoding="utf-8")
     tmp.replace(path)
 
 def corpus_summary(detailed: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
