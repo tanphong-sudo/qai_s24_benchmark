@@ -3,7 +3,7 @@
 The laptop only orchestrates preprocessing/API calls; neural encoder/decoder inference runs on the hosted Samsung Galaxy S24 NPU.
 """
 
-import os, sys, re, gc, json, math, time, random, hashlib, shutil, zipfile, unicodedata, platform, subprocess, inspect
+import os, sys, re, gc, json, math, time, random, hashlib, shutil, zipfile, unicodedata, platform, inspect
 from datetime import datetime, timezone
 import importlib.metadata as im
 from dataclasses import dataclass
@@ -168,11 +168,13 @@ if not api_token:
 if not api_token:
     raise RuntimeError("Missing Qualcomm AI Hub API token")
 
-subprocess.run(["qai-hub", "configure", "--api_token", api_token], check=True,
-               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+# Configure Qualcomm AI Hub directly through the Python API.
+# This is Qualcomm's documented "session API token" flow and avoids relying
+# on the `qai-hub` command being present on Windows PATH.
+client_config = hub.ClientConfig(api_token=api_token)
+client = hub.Client(client_config)
 del api_token
-
-client = hub.Client()
+print("Qualcomm AI Hub session authenticated via Python ClientConfig.")
 if not hasattr(client, "submit_compile_and_link_jobs"):
     raise RuntimeError("Installed qai-hub client is too old: submit_compile_and_link_jobs() is required.")
 
@@ -1473,6 +1475,7 @@ evidence={
     "final_table_sha256": _sha256_file(FINAL_UPLOAD_PATH),
     "final_table": FINAL_UPLOAD_PATH.name,
     "api_token_stored": False,
+    "auth_mode": "session_ClientConfig",
 }
 RUN_EVIDENCE=RESULT_DIR/"RUN_EVIDENCE.json"
 atomic_json(evidence,RUN_EVIDENCE)
@@ -1524,4 +1527,3 @@ print("\nFINAL ONE-FILE SUBMISSION BUNDLE:",BUNDLE_PATH)
 print("Contains final table + Qualcomm job IDs/URLs + exact S24 device evidence + hashes.")
 if RUN_MODE=="smoke":
     print("Smoke passed. Change RUN_MODE='benchmark' and Run all for the requested 100-sample benchmark.")
-
