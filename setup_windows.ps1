@@ -143,6 +143,31 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ------------------------------------------------------------
+# Preflight checks before any paid/remote Workbench jobs start
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Validating installed dependencies and benchmark code..."
+
+& $venvPython -m pip check
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Installed Python dependencies are inconsistent."
+}
+
+& $venvPython -m py_compile run_benchmark.py
+
+if ($LASTEXITCODE -ne 0) {
+    throw "run_benchmark.py failed the Python syntax check."
+}
+
+& $venvPython -m unittest discover -s tests -v
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Benchmark regression preflight failed."
+}
+
+# ------------------------------------------------------------
 # Start benchmark
 # ------------------------------------------------------------
 

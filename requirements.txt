@@ -1,4 +1,5 @@
 qai-hub-models[whisper-tiny,whisper-small]==0.57.0
+qai-hub==0.55.0
 datasets>=3.6,<5
 huggingface_hub>=0.34
 jiwer>=3.0

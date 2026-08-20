@@ -40,3 +40,7 @@ Các Qualcomm job URL có thể mở khi đăng nhập đúng AI Hub account c�
 
 ## Resume / cache
 Toàn bộ cache, linked model artifacts, profile và per-sample checkpoint nằm trong `qai_asr_s24_benchmark\`. Không xóa thư mục này nếu muốn resume.
+
+- Trước khi tạo Qualcomm job, launcher chạy `pip check`, syntax check và regression preflight.
+- Nếu linked model cũ có producer đã `FAILED`, script tự loại cache đó và compile/link lại thay vì tiếp tục tới profile.
+- Profile lỗi tạm thời không chặn WER/CER và sẽ được retry ở lần chạy sau; inference job lỗi luôn dừng với status và URL Qualcomm cụ thể.

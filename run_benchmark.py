@@ -42,7 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-linked-iospec-fallback-v1"
+PATCH_VERSION = "2026-08-20-status-runtime-v3"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = "benchmark"       # "smoke", "benchmark", or "full"
@@ -376,12 +376,14 @@ def corpus_summary(detailed: pd.DataFrame, group_cols: list[str]) -> pd.DataFram
             "samples_wer_over_100_percent": int((g.sample_wer > 1).sum()),
             "decode_steps": int(g.decode_steps.sum()),
             "api_wall_hours": float(g.api_wall_s_share.sum()/3600),
-            "estimated_device_compute_sec": float(g.estimated_device_compute_ms.sum()/1000),
+            "estimated_device_compute_sec": (float(g.estimated_device_compute_ms.sum(min_count=1)/1000)
+                                             if pd.notna(g.estimated_device_compute_ms.sum(min_count=1)) else np.nan),
         })
         dur=float(g.duration_sec.sum())
-        dev=float(g.estimated_device_compute_ms.sum()/1000)
-        r["estimated_device_rtf"] = dev/dur if dur else np.nan
-        r["estimated_device_x_realtime"] = dur/dev if dev else np.nan
+        _dev_sum=g.estimated_device_compute_ms.sum(min_count=1)
+        dev=float(_dev_sum/1000) if pd.notna(_dev_sum) else np.nan
+        r["estimated_device_rtf"] = dev/dur if dur and np.isfinite(dev) else np.nan
+        r["estimated_device_x_realtime"] = dur/dev if np.isfinite(dev) and dev>0 else np.nan
         out.append(r)
     return pd.DataFrame(out)
 
@@ -637,7 +639,52 @@ def inspect_linked_contract(model, cached: dict):
     return pd.DataFrame(rows)
 
 REMOTE_MANIFEST_PATH=ARTIFACT_DIR/"hub_artifacts.json"
-remote_manifest=json.loads(REMOTE_MANIFEST_PATH.read_text()) if REMOTE_MANIFEST_PATH.exists() else {}
+
+def _safe_json_load(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        bad=path.with_suffix(path.suffix+f".corrupt_{int(time.time())}")
+        try: path.replace(bad)
+        except Exception: pass
+        print(f"WARNING: invalid JSON cache {path}; starting fresh. Reason: {exc!r}")
+        return default
+
+def _status_line(status) -> str:
+    if status is None:
+        return "<no status>"
+    return f"code={getattr(status,'code',None)!r}, success={getattr(status,'success',False)!r}, failure={getattr(status,'failure',False)!r}, message={getattr(status,'message',None)!r}"
+
+def _wait_job_success(job, what: str):
+    status=job.wait()
+    print(f"{what}: {_status_line(status)} | {getattr(job,'url',None)}")
+    if not bool(getattr(status,"success",False)):
+        raise RuntimeError(f"{what} FAILED: {_status_line(status)} | {getattr(job,'url',None)}")
+    return status
+
+def _model_producer_status(model):
+    ok=bool(model.wait())
+    producer=model.get_producer()
+    if producer is None:
+        return ok, None, "model has no producer"
+    status=producer.get_status()
+    if not bool(getattr(status,"finished",False)):
+        status=producer.wait()
+    success=ok and bool(getattr(status,"success",False))
+    return success, producer, _status_line(status)
+
+def _require_model_ready(model, label: str):
+    success, producer, detail=_model_producer_status(model)
+    if not success:
+        raise RuntimeError(
+            f"{label}: target model {getattr(model,'model_id',None)} has a failed producer. "
+            f"producer={getattr(producer,'url',None)}; {detail}"
+        )
+    return producer
+
+remote_manifest=_safe_json_load(REMOTE_MANIFEST_PATH,{})
 MODEL_ARTIFACTS={}
 
 for label,repo in MODEL_IDS.items():
@@ -647,11 +694,23 @@ for label,repo in MODEL_IDS.items():
     linked=None
     if cached and cached.get("cache_key")==key and cached.get("linked_model_id"):
         try:
-            linked=client.get_model(cached["linked_model_id"])
-            linked.wait()
-            print("Reusing linked S24 model:", linked.model_id, linked.url)
+            candidate=client.get_model(cached["linked_model_id"])
+            success,producer,detail=_model_producer_status(candidate)
+            if not success:
+                print(
+                    f"Cached linked model {candidate.model_id} is INVALID because its producer failed; "
+                    f"discarding cache. producer={getattr(producer,'url',None)}; {detail}"
+                )
+                remote_manifest.pop(label,None)
+                atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
+            else:
+                linked=candidate
+                print("Reusing verified linked S24 model:", linked.model_id, linked.url)
         except Exception as exc:
-            print("Cached remote model unavailable; rebuilding:",repr(exc)); linked=None
+            print("Cached remote model unavailable/invalid; rebuilding:",repr(exc))
+            linked=None
+            remote_manifest.pop(label,None)
+            atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
 
     if linked is None:
         meta=export_whisper_components(label,repo)
@@ -675,15 +734,42 @@ for label,repo in MODEL_IDS.items():
             compile_options=compile_options,
             link_options=f"--qairt_version {QAIRT_VERSION}",
         )
-        if link_job is None: raise RuntimeError("submit_compile_and_link_jobs returned no LinkJob")
+        if link_job is None:
+            raise RuntimeError("submit_compile_and_link_jobs returned no LinkJob")
         for j in [*compile_jobs, link_job]:
-            job_device = getattr(j, "device", None)
-            if job_device is not None and getattr(job_device, "name", None) != TARGET_DEVICE_NAME:
+            job_device=getattr(j,"device",None)
+            if job_device is not None and getattr(job_device,"name",None)!=TARGET_DEVICE_NAME:
                 raise RuntimeError(f"Qualcomm job unexpectedly targeted {job_device}; expected exact {TARGET_DEVICE_NAME}")
         print("Compile jobs:",[j.url for j in compile_jobs]); print("Link job:",link_job.url)
+
+        # IMPORTANT: .wait() returns a JobStatus; it does NOT raise when the remote
+        # job fails. Validate every compile and the link explicitly before caching
+        # or attempting profile/inference.
+        compile_failures=[]
+        for idx,j in enumerate(compile_jobs):
+            st=j.wait()
+            print(f"Compile[{idx}] finished: {_status_line(st)} | {j.url}")
+            if not bool(getattr(st,"success",False)):
+                compile_failures.append((idx,j,st))
+        link_status=link_job.wait()
+        print(f"Link finished: {_status_line(link_status)} | {link_job.url}")
+        if compile_failures or not bool(getattr(link_status,"success",False)):
+            bits=[]
+            for idx,j,st in compile_failures:
+                bits.append(f"compile[{idx}] {j.url}: {_status_line(st)}")
+            if not bool(getattr(link_status,"success",False)):
+                bits.append(f"link {link_job.url}: {_status_line(link_status)}")
+            raise RuntimeError(
+                f"Qualcomm compile/link failed for {label}. " + " | ".join(bits)
+            )
+
         linked=link_job.get_target_model()
-        if linked is None: raise RuntimeError(f"Link failed: {link_job.url}")
-        linked.wait()
+        if linked is None:
+            raise RuntimeError(f"Successful link job returned no target model: {link_job.url}")
+        if not linked.wait():
+            raise RuntimeError(f"Linked target model did not become ready despite successful link: {link_job.url}")
+        producer=_require_model_ready(linked,label)
+
         cached={
             "cache_key":key,"repo":repo,"revision":MODEL_REVISIONS[repo],
             "source_encoder_model_id":src_enc.model_id,"source_decoder_model_id":src_dec.model_id,
@@ -695,10 +781,10 @@ for label,repo in MODEL_IDS.items():
             "encoder_output_names":meta["encoder_output_names"],"decoder_output_names":meta["decoder_output_names"],
             "config":meta["config"],"snapshot":meta["snapshot"],
         }
-        remote_manifest[label]=cached; atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
+        remote_manifest[label]=cached
+        atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
     else:
-        # Rehydrate local metadata using the installed qai-hub-models API itself.
-        # This avoids the broken old pattern HfWhisperEncoder.get_input_spec(cfg.num_mel_bins).
+        # Rehydrate exact local model contracts from the pinned source revision.
         snap=source_snapshot(repo)
         original=HfWhisper.load_whisper_model(str(snap))
         cfg,enc,dec,enc_spec,dec_spec,enc_out,dec_out=_component_contracts(original)
@@ -710,31 +796,37 @@ for label,repo in MODEL_IDS.items():
         cached["decoder_input_spec"]=dec_spec
         del enc,dec,original
         gc.collect()
+        producer=_require_model_ready(linked,label)
 
-    linked.wait()
-    producer = linked.get_producer()
-    producer_device = getattr(producer, "device", None) if producer is not None else None
-    if producer_device is None or getattr(producer_device, "name", None) != TARGET_DEVICE_NAME:
+    producer_device=getattr(producer,"device",None) if producer is not None else None
+    if producer_device is None or getattr(producer_device,"name",None)!=TARGET_DEVICE_NAME:
         raise RuntimeError(
             f"Linked artifact {linked.model_id} is not proven to be produced for exact {TARGET_DEVICE_NAME}: "
             f"producer={producer}, producer_device={producer_device}"
         )
-    model_type_text = str(getattr(linked, "model_type", "")).lower()
+    model_type_text=str(getattr(linked,"model_type","")).lower()
     if "qnn" not in model_type_text or "context" not in model_type_text:
-        raise RuntimeError(f"Expected QNN Context Binary target model; got {getattr(linked, 'model_type', None)}")
-    cached["producer_device"] = producer_device.name
-    cached["linked_model_type"] = str(getattr(linked, "model_type", ""))
-    cached["linked_model_metadata"] = {str(k): str(v) for k,v in (getattr(linked, "metadata", {}) or {}).items()}
+        raise RuntimeError(f"Expected QNN Context Binary target model; got {getattr(linked,'model_type',None)}")
+    cached["producer_device"]=producer_device.name
+    cached["linked_model_type"]=str(getattr(linked,"model_type",""))
+    cached["linked_model_metadata"]={str(k):str(v) for k,v in (getattr(linked,"metadata",{}) or {}).items()}
     contract=inspect_linked_contract(linked,cached)
     display(contract)
     MODEL_ARTIFACTS[label]={**cached,"linked_model":linked}
 
 atomic_json({k:{kk:vv for kk,vv in v.items() if kk!="linked_model"} for k,v in MODEL_ARTIFACTS.items()},REMOTE_MANIFEST_PATH)
-print("All three linked model artifacts are ready on the exact S24 target.")
-
+print("All three linked model artifacts have SUCCESS producers and are ready on the exact S24 target.")
 
 PROFILE_PATH=ARTIFACT_DIR/"s24_profiles.json"
-profile_cache=json.loads(PROFILE_PATH.read_text()) if PROFILE_PATH.exists() else {}
+profile_cache=_safe_json_load(PROFILE_PATH,{})
+PROFILE_REQUIRED=False  # Main requirement is on-S24 dataset inference; profile failure must not block WER.
+
+def _profile_cache_needs_refresh(cached_profile, profile_key: str, required: list[str]) -> bool:
+    if not cached_profile or cached_profile.get("profile_key") != profile_key:
+        return True
+    if cached_profile.get("profile_error"):
+        return True
+    return any(cached_profile.get(key) is None for key in required)
 
 def _find_profile_metric(obj, key):
     if isinstance(obj, dict):
@@ -745,50 +837,80 @@ def _find_profile_metric(obj, key):
             if found is not None:return found
     return None
 
+def _range_upper(value):
+    if value is None:return None
+    if isinstance(value,(tuple,list)) and len(value)>=2:
+        return int(value[1])
+    try:return int(value)
+    except Exception:return None
+
 def profile_metrics(job):
+    status=job.wait()
+    if not bool(getattr(status,"success",False)):
+        raise RuntimeError(f"Profile job FAILED: {_status_line(status)} | {job.url}")
     report=job.download_profile()
     latency=_find_profile_metric(report,"estimated_inference_time")
-    inf_mem=_find_profile_metric(report,"estimated_inference_peak_memory")
-    first_mem=_find_profile_metric(report,"first_load_peak_memory")
-    warm_mem=_find_profile_metric(report,"warm_load_peak_memory")
+    # Support both current Workbench range metrics and legacy scalar names.
+    inf_mem=_range_upper(_find_profile_metric(report,"inference_memory_peak_range"))
+    first_mem=_range_upper(_find_profile_metric(report,"first_load_memory_peak_range"))
+    warm_mem=_range_upper(_find_profile_metric(report,"warm_load_memory_peak_range"))
+    if inf_mem is None: inf_mem=_range_upper(_find_profile_metric(report,"estimated_inference_peak_memory"))
+    if first_mem is None: first_mem=_range_upper(_find_profile_metric(report,"first_load_peak_memory"))
+    if warm_mem is None: warm_mem=_range_upper(_find_profile_metric(report,"warm_load_peak_memory"))
     if latency is None:
         for s in client.get_job_summaries(limit=100):
             if getattr(s,"job_id",None)==job.job_id and getattr(s,"estimated_inference_time",None) is not None:
-                latency=int(s.estimated_inference_time);break
+                latency=int(s.estimated_inference_time)
+                if inf_mem is None:
+                    inf_mem=_range_upper(getattr(s,"inference_memory_peak_range",None))
+                break
     if latency is None:
         raise RuntimeError(f"Cannot find estimated_inference_time for {job.url}")
     return {
         "latency_us":int(latency),
-        "inference_peak_memory_bytes":int(inf_mem) if inf_mem is not None else None,
-        "first_load_peak_memory_bytes":int(first_mem) if first_mem is not None else None,
-        "warm_load_peak_memory_bytes":int(warm_mem) if warm_mem is not None else None,
+        "inference_peak_memory_bytes":inf_mem,
+        "first_load_peak_memory_bytes":first_mem,
+        "warm_load_peak_memory_bytes":warm_mem,
     },report
 
 PROFILE_ROWS=[]
 for label,a in MODEL_ARTIFACTS.items():
     linked=a["linked_model"]; enc_graph,dec_graph=a["graph_names"]
-    pkey=f"{linked.model_id}|{TARGET_DEVICE_NAME}|{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}"
-    cached=profile_cache.get(label)
-    required_memory_keys=[f"{c}_{m}" for c in ["encoder","decoder"] for m in [
-        "inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"]]
-    needs_refresh=(not cached or cached.get("profile_key")!=pkey or any(k not in cached for k in required_memory_keys))
+    _require_model_ready(linked,label)
+    pkey=f"{linked.model_id}|{TARGET_DEVICE_NAME}|{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}|profile-v2"
+    cached_profile=profile_cache.get(label)
+    required=["encoder_latency_us","decoder_latency_us"]
+    needs_refresh=_profile_cache_needs_refresh(cached_profile,pkey,required)
     if needs_refresh:
         vals={"profile_key":pkey,"linked_model_id":linked.model_id}
+        profile_errors=[]
         for component,graph in [("encoder",enc_graph),("decoder",dec_graph)]:
-            opts=f"--compute_unit npu --qairt_version {QAIRT_VERSION} --qnn_options context_enable_graphs={graph}"
-            job=client.submit_profile_job(linked,device=TARGET_DEVICE,name=f"{slug(label)}_{component}_s24",options=opts)
-            if getattr(getattr(job, "device", None), "name", None) != TARGET_DEVICE_NAME:
-                raise RuntimeError(f"Profile job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job, 'device', None)}")
-            metrics,report=profile_metrics(job)
-            vals[f"{component}_profile_job_id"]=job.job_id
-            vals[f"{component}_latency_us"]=metrics["latency_us"]
-            vals[f"{component}_profile_url"]=job.url
-            for k,v in metrics.items():
-                if k!="latency_us":vals[f"{component}_{k}"]=v
-        profile_cache[label]=vals; atomic_json(profile_cache,PROFILE_PATH)
+            try:
+                opts=f"--compute_unit npu --qairt_version {QAIRT_VERSION} --qnn_options context_enable_graphs={graph}"
+                job=client.submit_profile_job(linked,device=TARGET_DEVICE,name=f"{slug(label)}_{component}_s24",options=opts)
+                if getattr(getattr(job,"device",None),"name",None)!=TARGET_DEVICE_NAME:
+                    raise RuntimeError(f"Profile job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job,'device',None)}")
+                metrics,report=profile_metrics(job)
+                vals[f"{component}_profile_job_id"]=job.job_id
+                vals[f"{component}_profile_url"]=job.url
+                vals[f"{component}_latency_us"]=metrics["latency_us"]
+                for k,v in metrics.items():
+                    if k!="latency_us": vals[f"{component}_{k}"]=v
+            except Exception as exc:
+                profile_errors.append(f"{component}: {exc!r}")
+                print(f"WARNING: S24 profile failed for {label}/{component}; continuing to ASR inference because profiling is optional. {exc!r}")
+                vals[f"{component}_latency_us"]=None
+                vals[f"{component}_profile_job_id"]=None
+                vals[f"{component}_profile_url"]=None
+                for k in ["inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"]:
+                    vals[f"{component}_{k}"]=None
+                if PROFILE_REQUIRED: raise
+        vals["profile_error"]=" | ".join(profile_errors) if profile_errors else None
+        profile_cache[label]=vals
+        atomic_json(profile_cache,PROFILE_PATH)
     v=profile_cache[label]
-    enc_ms=v["encoder_latency_us"]/1000
-    dec_ms=v["decoder_latency_us"]/1000
+    enc_ms=(v.get("encoder_latency_us")/1000) if v.get("encoder_latency_us") is not None else np.nan
+    dec_ms=(v.get("decoder_latency_us")/1000) if v.get("decoder_latency_us") is not None else np.nan
     mem_values=[v.get(f"{c}_{m}") for c in ["encoder","decoder"] for m in [
         "inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"]]
     mem_values=[x for x in mem_values if x is not None]
@@ -796,18 +918,18 @@ for label,a in MODEL_ARTIFACTS.items():
     PROFILE_ROWS.append({
         "model":label,"linked_model_id":linked.model_id,"device":TARGET_DEVICE_NAME,
         "encoder_ms":enc_ms,"decoder_ms_per_token":dec_ms,
-        "encoder_plus_first_decoder_ms":enc_ms+dec_ms,
-        "max_200_step_compute_ms":enc_ms+(MEAN_DECODE_LEN-1)*dec_ms,
+        "encoder_plus_first_decoder_ms":enc_ms+dec_ms if np.isfinite(enc_ms) and np.isfinite(dec_ms) else np.nan,
+        "max_200_step_compute_ms":enc_ms+(MEAN_DECODE_LEN-1)*dec_ms if np.isfinite(enc_ms) and np.isfinite(dec_ms) else np.nan,
         "peak_ram_mb":peak_ram_mb,
-        "encoder_inference_peak_memory_mb":(v.get("encoder_inference_peak_memory_bytes") or np.nan)/(1024**2),
-        "decoder_inference_peak_memory_mb":(v.get("decoder_inference_peak_memory_bytes") or np.nan)/(1024**2),
-        "encoder_profile_job_id":v["encoder_profile_job_id"],"decoder_profile_job_id":v["decoder_profile_job_id"],
+        "encoder_inference_peak_memory_mb":(v.get("encoder_inference_peak_memory_bytes")/(1024**2)) if v.get("encoder_inference_peak_memory_bytes") is not None else np.nan,
+        "decoder_inference_peak_memory_mb":(v.get("decoder_inference_peak_memory_bytes")/(1024**2)) if v.get("decoder_inference_peak_memory_bytes") is not None else np.nan,
+        "encoder_profile_job_id":v.get("encoder_profile_job_id"),"decoder_profile_job_id":v.get("decoder_profile_job_id"),
+        "profile_error":v.get("profile_error"),
     })
 PROFILE_DF=pd.DataFrame(PROFILE_ROWS)
 PROFILE_MAP=PROFILE_DF.set_index("model").to_dict("index")
 PROFILE_DF.to_csv(RESULT_DIR/"s24_model_speed_memory_profile.csv",index=False)
 display(PROFILE_DF)
-
 
 def np_dtype_from_hub(dtype: Any):
     s=str(dtype).lower()
@@ -866,11 +988,27 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
     job=client.submit_inference_job(model=model,device=TARGET_DEVICE,inputs=payload,name=job_name,options=opts)
     if getattr(getattr(job, "device", None), "name", None) != TARGET_DEVICE_NAME:
         raise RuntimeError(f"Inference job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job, 'device', None)}")
+    _wait_job_success(job,f"Inference {job_name}")
     raw=job.download_output_data()
     wall=time.perf_counter()-t0
+    if raw is None or not hasattr(raw,"keys"):
+        raise RuntimeError(f"Inference {job_name} succeeded but returned no in-memory output data: {job.url}")
+    out_names=graph_output_names(model,graph)
+    missing=[name for name in out_names if name not in raw]
+    if missing:
+        raise RuntimeError(f"Workbench output-name contract changed for {graph}; missing {missing}; returned {list(raw)}")
+    k=len(examples)
+    per_example=[]
+    for i in range(k):
+        row={}
+        for name in out_names:
+            vals=raw[name]
+            if len(vals)!=k: raise RuntimeError(f"Output {name} returned {len(vals)} entries for {k} inputs")
+            row[name]=np.asarray(vals[i])
+        per_example.append(row)
     append_job_evidence({
         "kind": "inference",
-        "status": "output_downloaded",
+        "status": "success",
         "job_id": job.job_id,
         "job_url": job.url,
         "job_name": job_name,
@@ -882,19 +1020,6 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
         "qairt_api_version": QAIRT_VERSION,
         "wall_seconds": wall,
     })
-    out_names=graph_output_names(model,graph)
-    missing=[name for name in out_names if name not in raw]
-    if missing:
-        raise RuntimeError(f"Workbench output-name contract changed for {graph}; missing {missing}; returned {list(raw)}")
-    k=len(examples)
-    per_example=[]
-    for i in range(k):
-        row=[]
-        for name in out_names:
-            vals=raw[name]
-            if len(vals)!=k: raise RuntimeError(f"Output {name} returned {len(vals)} entries for {k} inputs")
-            row.append(np.asarray(vals[i]))
-        per_example.append(row)
     return per_example,wall,job.job_id
 
 @dataclass
@@ -915,14 +1040,20 @@ class S24WhisperRuntime:
         self.processor=AutoProcessor.from_pretrained(self.snapshot)
         try:self.gen=GenerationConfig.from_pretrained(self.snapshot)
         except Exception:self.gen=GenerationConfig()
-        self.config=WhisperConfig.from_pretrained(self.snapshot)
+        self.config=WhisperConfig.from_dict(self.a["config"])
         self.enc_out_names=self.a["encoder_output_names"]
         self.dec_out_names=self.a["decoder_output_names"]
-        if graph_output_names(self.model,self.enc_graph) != self.enc_out_names:
-            raise RuntimeError("Encoder target output order/names differ from Qualcomm source contract")
-        if graph_output_names(self.model,self.dec_graph) != self.dec_out_names:
-            raise RuntimeError("Decoder target output order/names differ from Qualcomm source contract")
+        if set(graph_output_names(self.model,self.enc_graph)) != set(self.enc_out_names):
+            raise RuntimeError("Encoder target output names differ from Qualcomm source contract")
+        if set(graph_output_names(self.model,self.dec_graph)) != set(self.dec_out_names):
+            raise RuntimeError("Decoder target output names differ from Qualcomm source contract")
         self.dec_input_spec={t.name:t for t in graph_input_specs(self.model,self.dec_graph)}
+        expected_dec={"logits"} | {f"{p}_cache_self_{i}_out" for i in range(self.config.decoder_layers) for p in ("k","v")}
+        if set(self.dec_out_names)!=expected_dec:
+            raise RuntimeError(f"Unexpected Qualcomm Whisper decoder outputs for {label}: {self.dec_out_names}")
+        expected_cross={f"{p}_cache_cross_{i}" for i in range(self.config.decoder_layers) for p in ("k","v")}
+        if set(self.enc_out_names)!=expected_cross:
+            raise RuntimeError(f"Unexpected Qualcomm Whisper encoder outputs for {label}: {self.enc_out_names}")
 
     def forced_prompt(self,language: str):
         fn=getattr(self.processor,"get_decoder_prompt_ids",None) or getattr(self.processor.tokenizer,"get_decoder_prompt_ids",None)
@@ -931,13 +1062,15 @@ class S24WhisperRuntime:
         return {int(pos):int(tok) for pos,tok in pairs}
 
     def _new_state(self,cross_values):
-        cross=dict(zip(self.enc_out_names,cross_values))
+        if not isinstance(cross_values,dict):
+            raise TypeError(f"Encoder output must be a name->tensor dict, got {type(cross_values)}")
+        cross={name:cross_values[name] for name in self.enc_out_names}
         self_cache={}
         for name,ts in self.dec_input_spec.items():
             if re.fullmatch(r"[kv]_cache_self_\d+_in",name):
                 self_cache[name]=np.zeros(tuple(ts.shape),dtype=np_dtype_from_hub(ts.dtype))
         mask_ts=self.dec_input_spec["attention_mask"]
-        mask=np.full(tuple(mask_ts.shape),float(self.config.mask_neg),dtype=np_dtype_from_hub(mask_ts.dtype))
+        mask=np.full(tuple(mask_ts.shape),float(getattr(self.config,"mask_neg",-100.0)),dtype=np_dtype_from_hub(mask_ts.dtype))
         pos_ts=self.dec_input_spec["position_ids"]
         pos=np.zeros(tuple(pos_ts.shape),dtype=np_dtype_from_hub(pos_ts.dtype))
         sot=int(getattr(self.config,"decoder_start_token_id",None) or self.processor.tokenizer.bos_token_id)
@@ -967,6 +1100,8 @@ class S24WhisperRuntime:
         first_free=max(forced.keys(),default=0)+1
         eos=int(getattr(self.config,"eos_token_id",None) or self.processor.tokenizer.eos_token_id)
         decoder_wall=0.0; decoder_jobs=[]
+        per_state_last_decoder_job=[None]*len(states)
+        per_state_decoder_job_count=[0]*len(states)
 
         for n in range(MEAN_DECODE_LEN-1):
             active=[i for i,s in enumerate(states) if not s.done]
@@ -982,24 +1117,33 @@ class S24WhisperRuntime:
             decoder_wall+=wall; decoder_jobs.append(jid)
             for state_idx,vals in zip(active,outs):
                 s=states[state_idx]
-                token=self._choose_next(vals[0],n+1,forced,first_free)
+                per_state_last_decoder_job[state_idx]=jid
+                per_state_decoder_job_count[state_idx]+=1
+                if "logits" not in vals:
+                    raise RuntimeError(f"Decoder output missing logits; got {list(vals)}")
+                token=self._choose_next(vals["logits"],n+1,forced,first_free)
                 s.tokens.append(token)
-                # decoder outputs: logits, then k/v self-cache for each block
                 for block in range(self.config.decoder_layers):
-                    s.self_cache[f"k_cache_self_{block}_in"]=vals[1+2*block]
-                    s.self_cache[f"v_cache_self_{block}_in"]=vals[2+2*block]
+                    k_out=f"k_cache_self_{block}_out"
+                    v_out=f"v_cache_self_{block}_out"
+                    if k_out not in vals or v_out not in vals:
+                        raise RuntimeError(f"Decoder output missing cache tensors for block {block}; got {list(vals)}")
+                    s.self_cache[f"k_cache_self_{block}_in"]=vals[k_out]
+                    s.self_cache[f"v_cache_self_{block}_in"]=vals[v_out]
                 s.position_ids=s.position_ids+1
                 if token==eos:s.done=True
         for s in states:
             if not s.done:s.truncated=True
         texts=[self.processor.tokenizer.decode(s.tokens,skip_special_tokens=True).strip() for s in states]
         total_wall=enc_wall+decoder_wall
-        meta={"encoder_job_id":enc_job,"last_decoder_job_id":decoder_jobs[-1] if decoder_jobs else None,
-              "decoder_job_count":len(decoder_jobs),"api_batch_wall_s":total_wall}
         return [
-            {"raw_prediction":text,"decode_steps":len(s.tokens)-1,"truncated":s.truncated,**meta,
+            {"raw_prediction":text,"decode_steps":len(s.tokens)-1,"truncated":s.truncated,
+             "encoder_job_id":enc_job,
+             "last_decoder_job_id":per_state_last_decoder_job[i],
+             "decoder_job_count":per_state_decoder_job_count[i],
+             "api_batch_wall_s":total_wall,
              "api_wall_s_share":total_wall/max(1,len(states))}
-            for text,s in zip(texts,states)
+            for i,(text,s) in enumerate(zip(texts,states))
         ]
 
 RUNTIMES={label:S24WhisperRuntime(label) for label in MODEL_IDS}
@@ -1070,7 +1214,9 @@ def run_predictions(benchmark_id:str, metadata:pd.DataFrame, wave_getter, langua
             preds=_transcribe_adaptive(batch,f"{slug(benchmark_id)}_{start:06d}")
             prof=PROFILE_MAP[label]
             for (_,r),pred in zip(batch.iterrows(),preds):
-                est_ms=prof["encoder_ms"]+pred["decode_steps"]*prof["decoder_ms_per_token"]
+                est_ms=(prof["encoder_ms"]+pred["decode_steps"]*prof["decoder_ms_per_token"]
+                        if np.isfinite(prof.get("encoder_ms",np.nan)) and np.isfinite(prof.get("decoder_ms_per_token",np.nan))
+                        else np.nan)
                 rows.append({"sample_key":r.sample_key,"model":label,**pred,"estimated_device_compute_ms":est_ms,
                              "linked_model_id":MODEL_ARTIFACTS[label]["linked_model"].model_id})
             frame=pd.DataFrame(rows)
