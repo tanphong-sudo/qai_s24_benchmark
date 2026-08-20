@@ -73,6 +73,7 @@ class InferenceStatusTests(unittest.TestCase):
             "TARGET_DEVICE": SimpleNamespace(name="Samsung Galaxy S24"),
             "TARGET_DEVICE_NAME": "Samsung Galaxy S24",
             "QAIRT_VERSION": "2.39",
+            "HUB_JOB_RETRIES": 1,
             "graph_input_specs": lambda model, graph: [tensor],
             "graph_output_names": lambda model, graph: ["output"],
             "cast_for_tensor": lambda value, spec: np.asarray(value, dtype=np.float32),
@@ -93,6 +94,7 @@ class InferenceStatusTests(unittest.TestCase):
             "_status_line",
             "_wait_job_success",
             "_qnn_runtime_options",
+            "_run_inference_job_with_retries",
             "infer_graph",
             extra_globals=self._globals(job, evidence),
         )
@@ -123,6 +125,7 @@ class InferenceStatusTests(unittest.TestCase):
             "_status_line",
             "_wait_job_success",
             "_qnn_runtime_options",
+            "_run_inference_job_with_retries",
             "infer_graph",
             extra_globals=self._globals(job, evidence),
         )
@@ -144,6 +147,62 @@ class InferenceStatusTests(unittest.TestCase):
 
 
 class CacheAndDependencyTests(unittest.TestCase):
+    def test_direct_component_compile_jobs_target_qnn_dlc_without_linking(self):
+        submissions = []
+
+        def submit_compile_job(**kwargs):
+            submissions.append(kwargs)
+            return SimpleNamespace(job_id=f"jp_{len(submissions)}")
+
+        funcs = load_functions("_submit_component_compile_jobs")
+        jobs = funcs["_submit_component_compile_jobs"](
+            SimpleNamespace(submit_compile_job=submit_compile_job),
+            ["encoder_source", "decoder_source"],
+            [{"input_features": ((1, 80, 3000), "float32")}, {"input_ids": ((1, 1), "int32")}],
+            [["cross_cache"], ["logits"]],
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "whisper_small_s24",
+            "2.49",
+        )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(len(submissions), 2)
+        self.assertTrue(all("--target_runtime qnn_dlc" in row["options"] for row in submissions))
+        self.assertEqual([row["model"] for row in submissions], ["encoder_source", "decoder_source"])
+
+    def test_inference_retries_a_failed_remote_job(self):
+        failed = SimpleNamespace(
+            job_id="jp_failed",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_failed",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=False, code="FAILED"),
+            download_output_data=lambda: None,
+        )
+        succeeded = SimpleNamespace(
+            job_id="jp_success",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_success",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            download_output_data=lambda: {"output": [np.array([1.0])]},
+        )
+        jobs = iter([failed, succeeded])
+        client = SimpleNamespace(submit_inference_job=lambda **kwargs: next(jobs))
+        funcs = load_functions("_status_line", "_run_inference_job_with_retries")
+
+        job, output = funcs["_run_inference_job_with_retries"](
+            client,
+            SimpleNamespace(model_id="mm_model"),
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            {"input": [np.array([1.0])]},
+            "retry_test",
+            "--compute_unit npu",
+            "Samsung Galaxy S24",
+            2,
+        )
+
+        self.assertIs(job, succeeded)
+        self.assertIn("output", output)
+
     def test_single_graph_qnn_dlc_uses_remote_none_keyed_contract(self):
         input_tensor = SimpleNamespace(name="input_features", shape=(1, 80, 3000), dtype="float16")
         output_tensor = SimpleNamespace(name="k_cache_cross_0", shape=(1,), dtype="float16")
@@ -322,6 +381,15 @@ class CacheAndDependencyTests(unittest.TestCase):
         self.assertIn("-m pip check", setup)
         self.assertIn("-m py_compile run_benchmark.py", setup)
         self.assertIn("-m unittest discover -s tests -v", setup)
+        self.assertIn('$env:QAI_RUN_MODE = "benchmark"', setup)
+        self.assertIn('$env:QAI_ARTIFACT_POLICY = "separate_qnn_dlc"', setup)
+        self.assertIn('$env:QAI_ENABLE_PROFILING = "0"', setup)
+
+    def test_default_run_keeps_100_samples_and_skips_optional_profiling(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+        self.assertRegex(source, r'QAI_RUN_MODE",\s*"benchmark"')
+        self.assertRegex(source, r'BENCHMARK_N\s*=\s*100')
+        self.assertRegex(source, r'QAI_ENABLE_PROFILING",\s*"0"')
 
 
 if __name__ == "__main__":

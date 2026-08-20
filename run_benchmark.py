@@ -42,10 +42,10 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-qnn-dlc-link-fallback-v4"
+PATCH_VERSION = "2026-08-20-direct-dlc-retry-v5"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
-RUN_MODE = "benchmark"       # "smoke", "benchmark", or "full"
+RUN_MODE = os.environ.get("QAI_RUN_MODE", "benchmark").strip().lower()
 BENCHMARK_N = 100            # 100 samples for each benchmark category
 SMOKE_N = 3
 SMOKE_VIMD_PER_REGION = 2
@@ -62,6 +62,9 @@ VIMEDCSS_INCLUDE_HARD = False
 # Workbench inference job. If a 2-sample payload fails, code automatically
 # retries as single-sample jobs without changing any prediction logic.
 HUB_MICROBATCH = 2
+HUB_JOB_RETRIES = max(1, int(os.environ.get("QAI_HUB_JOB_RETRIES", "3")))
+ARTIFACT_BUILD_POLICY = os.environ.get("QAI_ARTIFACT_POLICY", "separate_qnn_dlc").strip().lower()
+ENABLE_PROFILING = os.environ.get("QAI_ENABLE_PROFILING", "0").strip().lower() in {"1", "true", "yes"}
 QAIRT_VERSION_REQUEST = "latest"
 TARGET_DEVICE_NAME = "Samsung Galaxy S24"  # exact hosted device, NEVER Family/Proxy fallback
 SR = 16_000
@@ -145,6 +148,9 @@ print({
     "benchmark_n": BENCHMARK_N,
     "work_root": str(WORK_ROOT),
     "hub_microbatch": HUB_MICROBATCH,
+    "hub_job_retries": HUB_JOB_RETRIES,
+    "artifact_build_policy": ARTIFACT_BUILD_POLICY,
+    "profiling_enabled": ENABLE_PROFILING,
     "max_decode_len": MEAN_DECODE_LEN,
     "target_device": TARGET_DEVICE_NAME,
     "qairt_requested": QAIRT_VERSION_REQUEST,
@@ -153,6 +159,7 @@ print("Python", sys.version.split()[0], "| torch", torch.__version__, "| qai-hub
       "| qai-hub-models", im.version("qai-hub-models"))
 assert RUN_MODE in {"smoke", "benchmark", "full"}
 assert HUB_MICROBATCH >= 1
+assert ARTIFACT_BUILD_POLICY in {"separate_qnn_dlc", "linked_context"}
 assert sum(VIMD_BENCHMARK_REGION_TARGETS.values()) == BENCHMARK_N
 assert MEAN_DECODE_LEN == 200, "This benchmark's decoder state layout assumes Qualcomm HfWhisper MEAN_DECODE_LEN=200."
 
@@ -177,8 +184,10 @@ client_config = hub.ClientConfig(api_token=api_token)
 client = hub.Client(client_config)
 del api_token
 print("Qualcomm AI Hub session authenticated via Python ClientConfig.")
-if not hasattr(client, "submit_compile_and_link_jobs"):
-    raise RuntimeError("Installed qai-hub client is too old: submit_compile_and_link_jobs() is required.")
+if not hasattr(client, "submit_compile_job"):
+    raise RuntimeError("Installed qai-hub client is too old: submit_compile_job() is required.")
+if ARTIFACT_BUILD_POLICY=="linked_context" and not hasattr(client, "submit_compile_and_link_jobs"):
+    raise RuntimeError("QAI_ARTIFACT_POLICY=linked_context requires submit_compile_and_link_jobs().")
 
 exact_devices = client.get_devices(name=TARGET_DEVICE_NAME)
 if not exact_devices:
@@ -260,6 +269,9 @@ BASE_MANIFEST = {
     "vimd_benchmark_region_targets": VIMD_BENCHMARK_REGION_TARGETS,
     "vimedcss_include_hard": VIMEDCSS_INCLUDE_HARD,
     "hub_microbatch": HUB_MICROBATCH,
+    "hub_job_retries": HUB_JOB_RETRIES,
+    "artifact_build_policy": ARTIFACT_BUILD_POLICY,
+    "profiling_enabled": ENABLE_PROFILING,
     "mean_decode_len": MEAN_DECODE_LEN,
     "decoding": {
         "greedy": True,
@@ -587,10 +599,9 @@ class _LocalTensorSpec:
 def _normalize_compile_input_spec(spec: Any) -> list[_LocalTensorSpec]:
     """Normalize qai-hub-models compile InputSpec into TensorSpec-like rows.
 
-    Qualcomm Workbench normally exposes Model.input_spec for linked multi-graph
-    context binaries, but some client/server combinations return an empty IOSpec.
-    The exact compile input spec is still authoritative because it was submitted
-    with submit_compile_and_link_jobs().
+    Qualcomm Workbench normally exposes Model.input_spec for QNN DLC/context
+    artifacts, but some client/server combinations return an empty IOSpec. The
+    exact input spec submitted to the compile job remains authoritative.
     """
     out=[]
     if isinstance(spec, dict):
@@ -674,6 +685,32 @@ def _wait_job_success(job, what: str):
         raise RuntimeError(f"{what} FAILED: {_status_line(status)} | {getattr(job,'url',None)}")
     return status
 
+def _run_inference_job_with_retries(client_obj, model, device, inputs, name: str,
+                                    options: str, target_device_name: str, max_attempts: int):
+    failures=[]
+    for attempt in range(1,max_attempts+1):
+        job=None
+        try:
+            job=client_obj.submit_inference_job(
+                model=model,device=device,inputs=inputs,name=name,options=options
+            )
+            if getattr(getattr(job,"device",None),"name",None)!=target_device_name:
+                raise RuntimeError(f"Inference job {getattr(job,'url',None)} is not on exact {target_device_name}: {getattr(job,'device',None)}")
+            status=job.wait()
+            print(f"Inference {name} attempt {attempt}/{max_attempts}: {_status_line(status)} | {getattr(job,'url',None)}")
+            if not bool(getattr(status,"success",False)):
+                raise RuntimeError(f"remote status {_status_line(status)}")
+            raw=job.download_output_data()
+            if raw is None or not hasattr(raw,"keys"):
+                raise RuntimeError("successful job returned no in-memory output data")
+            return job,raw
+        except Exception as exc:
+            detail=f"attempt {attempt}: job={getattr(job,'url',None)} error={exc!r}"
+            failures.append(detail)
+            if attempt<max_attempts:
+                print(f"WARNING: inference {name} failed; retrying. {detail}")
+    raise RuntimeError(f"Inference {name} failed after {max_attempts} attempts. " + " | ".join(failures))
+
 def _model_producer_status(model):
     ok=bool(model.wait())
     producer=model.get_producer()
@@ -699,6 +736,23 @@ def _link_retry_options(qairt_version: str) -> list[str]:
         f"--qairt_version {qairt_version} --qnn_options default_graph_htp_optimizations=O=2",
         f"--qairt_version {qairt_version} --qnn_options default_graph_htp_optimizations=O=1",
     ]
+
+def _submit_component_compile_jobs(client_obj, source_models, input_specs, output_names,
+                                   device, name: str, qairt_version: str):
+    common=f"--target_runtime qnn_dlc --quantize_full_type float16 --quantize_io --qairt_version {qairt_version}"
+    jobs=[]
+    for component,model,spec,names in zip(
+        ("encoder","decoder"),source_models,input_specs,output_names
+    ):
+        options=f"--output_names {','.join(names)} {common}"
+        jobs.append(client_obj.submit_compile_job(
+            model=model,
+            device=device,
+            name=f"{name}_{component}",
+            input_specs=spec,
+            options=options,
+        ))
+    return jobs
 
 def _retry_link_jobs(client_obj, models, device, name: str, qairt_version: str):
     attempts=[]
@@ -793,23 +847,38 @@ for label,repo in MODEL_IDS.items():
             f"--output_names {','.join(meta['encoder_output_names'])} {common}",
             f"--output_names {','.join(meta['decoder_output_names'])} {common}",
         ]
-        print("Submitting compile + link jobs to exact",TARGET_DEVICE_NAME)
-        compile_jobs,link_job=client.submit_compile_and_link_jobs(
-            models=[src_enc,src_dec],
-            device=TARGET_DEVICE,
-            name=f"{slug(label)}_s24_whisper",
-            input_specs=[meta["encoder_input_spec"],meta["decoder_input_spec"]],
-            graph_names=graph_names,
-            compile_options=compile_options,
-            link_options=f"--qairt_version {QAIRT_VERSION}",
-        )
-        if link_job is None:
-            raise RuntimeError("submit_compile_and_link_jobs returned no LinkJob")
-        for j in [*compile_jobs, link_job]:
+        if ARTIFACT_BUILD_POLICY=="linked_context":
+            print("Submitting compile + link jobs to exact",TARGET_DEVICE_NAME)
+            compile_jobs,link_job=client.submit_compile_and_link_jobs(
+                models=[src_enc,src_dec],
+                device=TARGET_DEVICE,
+                name=f"{slug(label)}_s24_whisper",
+                input_specs=[meta["encoder_input_spec"],meta["decoder_input_spec"]],
+                graph_names=graph_names,
+                compile_options=compile_options,
+                link_options=f"--qairt_version {QAIRT_VERSION}",
+            )
+            if link_job is None:
+                raise RuntimeError("submit_compile_and_link_jobs returned no LinkJob")
+        else:
+            print("Submitting two independent QNN DLC compile jobs to exact",TARGET_DEVICE_NAME)
+            compile_jobs=_submit_component_compile_jobs(
+                client,
+                [src_enc,src_dec],
+                [meta["encoder_input_spec"],meta["decoder_input_spec"]],
+                [meta["encoder_output_names"],meta["decoder_output_names"]],
+                TARGET_DEVICE,
+                f"{slug(label)}_s24_whisper",
+                QAIRT_VERSION,
+            )
+            link_job=None
+        all_build_jobs=[*compile_jobs] + ([link_job] if link_job is not None else [])
+        for j in all_build_jobs:
             job_device=getattr(j,"device",None)
             if job_device is not None and getattr(job_device,"name",None)!=TARGET_DEVICE_NAME:
                 raise RuntimeError(f"Qualcomm job unexpectedly targeted {job_device}; expected exact {TARGET_DEVICE_NAME}")
-        print("Compile jobs:",[j.url for j in compile_jobs]); print("Link job:",link_job.url)
+        print("Compile jobs:",[j.url for j in compile_jobs])
+        if link_job is not None: print("Link job:",link_job.url)
 
         # IMPORTANT: .wait() returns a JobStatus; it does NOT raise when the remote
         # job fails. Validate every compile and the link explicitly before caching
@@ -820,8 +889,10 @@ for label,repo in MODEL_IDS.items():
             print(f"Compile[{idx}] finished: {_status_line(st)} | {j.url}")
             if not bool(getattr(st,"success",False)):
                 compile_failures.append((idx,j,st))
-        link_status=link_job.wait()
-        print(f"Link finished: {_status_line(link_status)} | {link_job.url}")
+        link_status=None
+        if link_job is not None:
+            link_status=link_job.wait()
+            print(f"Link finished: {_status_line(link_status)} | {link_job.url}")
         if compile_failures:
             bits=[]
             for idx,j,st in compile_failures:
@@ -838,16 +909,18 @@ for label,repo in MODEL_IDS.items():
             _require_model_ready(target,f"{label} compile[{idx}]")
             compiled_models.append(target)
 
-        link_attempts=[{
-            "job_id":link_job.job_id,
-            "job_url":link_job.url,
-            "options":f"--qairt_version {QAIRT_VERSION}",
-            "status":_status_line(link_status),
-            "success":bool(getattr(link_status,"success",False)),
-        }]
+        link_attempts=[]
         selected_link_job=None
         linked=None
-        if bool(getattr(link_status,"success",False)):
+        if link_job is not None:
+            link_attempts.append({
+                "job_id":link_job.job_id,
+                "job_url":link_job.url,
+                "options":f"--qairt_version {QAIRT_VERSION}",
+                "status":_status_line(link_status),
+                "success":bool(getattr(link_status,"success",False)),
+            })
+        if link_job is not None and bool(getattr(link_status,"success",False)):
             try:
                 linked=link_job.get_target_model()
                 if linked is not None and bool(linked.wait()):
@@ -862,7 +935,7 @@ for label,repo in MODEL_IDS.items():
                 link_attempts[0]["target_error"]=repr(exc)
                 linked=None
 
-        if linked is None:
+        if link_job is not None and linked is None:
             print("Initial context-binary link failed; retrying with lower HTP optimization levels O=2 then O=1.")
             selected_link_job,linked,retries=_retry_link_jobs(
                 client,compiled_models,TARGET_DEVICE,f"{slug(label)}_s24_whisper_link_retry",QAIRT_VERSION
@@ -878,9 +951,11 @@ for label,repo in MODEL_IDS.items():
         else:
             artifact_mode="separate_qnn_dlc"
             encoder_model,decoder_model=compiled_models
+            reason=("all context-binary links failed" if link_job is not None
+                    else "direct QNN DLC policy selected; no context link was requested")
             print(
-                "WARNING: all context-binary links failed; using the two successful QNN DLC models "
-                f"directly on the S24 NPU. encoder={encoder_model.model_id}, decoder={decoder_model.model_id}"
+                f"Using the two successful QNN DLC models directly on the S24 NPU ({reason}). "
+                f"encoder={encoder_model.model_id}, decoder={decoder_model.model_id}"
             )
 
         cached={
@@ -891,7 +966,8 @@ for label,repo in MODEL_IDS.items():
             "compile_job_urls":[j.url for j in compile_jobs],
             "link_job_id":getattr(selected_link_job,"job_id",None),
             "link_job_url":getattr(selected_link_job,"url",None),
-            "initial_link_job_id":link_job.job_id,"initial_link_job_url":link_job.url,
+            "initial_link_job_id":getattr(link_job,"job_id",None),
+            "initial_link_job_url":getattr(link_job,"url",None),
             "link_attempts":link_attempts,
             "linked_model_id":linked.model_id if linked is not None else None,
             "encoder_model_id":encoder_model.model_id,"decoder_model_id":decoder_model.model_id,
@@ -1021,13 +1097,32 @@ for label,a in MODEL_ARTIFACTS.items():
     cached_profile=profile_cache.get(label)
     required=["encoder_latency_us","decoder_latency_us"]
     needs_refresh=_profile_cache_needs_refresh(cached_profile,pkey,required)
-    if needs_refresh:
+    if needs_refresh and not ENABLE_PROFILING:
         vals={
             "profile_key":pkey,
             "artifact_mode":artifact_mode,
             "linked_model_id":a.get("linked_model_id"),
             "encoder_model_id":encoder_model.model_id,
             "decoder_model_id":decoder_model.model_id,
+            "profile_status":"disabled",
+            "profile_error":None,
+        }
+        for component in ("encoder","decoder"):
+            vals[f"{component}_latency_us"]=None
+            vals[f"{component}_profile_job_id"]=None
+            vals[f"{component}_profile_url"]=None
+            for key in ("inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"):
+                vals[f"{component}_{key}"]=None
+        profile_cache[label]=vals
+        atomic_json(profile_cache,PROFILE_PATH)
+    elif needs_refresh:
+        vals={
+            "profile_key":pkey,
+            "artifact_mode":artifact_mode,
+            "linked_model_id":a.get("linked_model_id"),
+            "encoder_model_id":encoder_model.model_id,
+            "decoder_model_id":decoder_model.model_id,
+            "profile_status":"requested",
         }
         profile_errors=[]
         for component,graph,model in [("encoder",enc_graph,encoder_model),("decoder",dec_graph,decoder_model)]:
@@ -1139,14 +1234,10 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
     payload={t.name:[cast_for_tensor(ex[t.name],t) for ex in examples] for t in ins}
     opts=_qnn_runtime_options(QAIRT_VERSION,graph,artifact_mode)
     t0=time.perf_counter()
-    job=client.submit_inference_job(model=model,device=TARGET_DEVICE,inputs=payload,name=job_name,options=opts)
-    if getattr(getattr(job, "device", None), "name", None) != TARGET_DEVICE_NAME:
-        raise RuntimeError(f"Inference job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job, 'device', None)}")
-    _wait_job_success(job,f"Inference {job_name}")
-    raw=job.download_output_data()
+    job,raw=_run_inference_job_with_retries(
+        client,model,TARGET_DEVICE,payload,job_name,opts,TARGET_DEVICE_NAME,HUB_JOB_RETRIES
+    )
     wall=time.perf_counter()-t0
-    if raw is None or not hasattr(raw,"keys"):
-        raise RuntimeError(f"Inference {job_name} succeeded but returned no in-memory output data: {job.url}")
     out_names=graph_output_names(model,graph)
     missing=[name for name in out_names if name not in raw]
     if missing:
@@ -1984,4 +2075,4 @@ print("Profile cache:",PROFILE_PATH)
 print("\nFINAL ONE-FILE SUBMISSION BUNDLE:",BUNDLE_PATH)
 print("Contains final table + Qualcomm job IDs/URLs + exact S24 device evidence + hashes.")
 if RUN_MODE=="smoke":
-    print("Smoke passed. Change RUN_MODE='benchmark' and Run all for the requested 100-sample benchmark.")
+    print("Smoke passed. Set QAI_RUN_MODE=benchmark for the requested 100-sample benchmark.")

@@ -17,9 +17,14 @@ Yêu cầu: **Windows 10/11 64-bit**, Internet ổn định, **Python 3.11 64-bi
 - ViMedCSS test: **100** utterances.
 - Models: Whisper Tiny, Whisper Small, PhoWhisper Base.
 - Qualcomm microbatch: **2**, tự fallback 1 nếu payload 2 mẫu không phù hợp.
+- Encoder và decoder mặc định được compile thành **hai QNN DLC riêng**, nên lượt chạy không phụ thuộc vào context-binary link.
+- Mỗi inference job được tự retry tối đa **3 lần** nếu Qualcomm queue/job/download lỗi tạm thời.
+- Profile latency/RAM là phần phụ và mặc định tắt; toàn bộ 100-sample prediction vẫn chạy trên S24 NPU.
 
 ## Cái gì thực sự chạy trên S24?
 Windows PC chỉ download/preprocess audio, gọi API, greedy token selection/decode và tính WER/CER. **Mọi encoder/decoder neural forward pass dùng để tạo prediction được submit qua Qualcomm AI Hub Workbench tới exact hosted `Samsung Galaxy S24`, với NPU explicitly requested.** Script abort nếu Qualcomm trả về device khác.
+
+Thiết lập mặc định của `RUN_WINDOWS.bat` là `QAI_RUN_MODE=benchmark`, tức vẫn giữ đúng **100 mẫu cho mỗi benchmark**. Các QNN DLC và checkpoint đã hoàn thành được reuse khi chạy lại.
 
 ## Một file để nộp / upload Drive
 Sau khi chạy thành công, file cần upload là:
@@ -28,8 +33,8 @@ Sau khi chạy thành công, file cần upload là:
 
 ZIP này chứa:
 - `FINAL_BENCHMARK_TABLE.csv` — bảng kết quả cuối.
-- `RUN_EVIDENCE.json` — exact device fingerprint, QAIRT version, model/dataset revisions, linked model IDs, compile/link/profile job IDs và representative inference job URLs.
-- `QUALCOMM_JOB_LEDGER.csv` — ledger các Qualcomm inference jobs thành công được ghi trong run, gồm job ID/URL, device, graph, linked model, batch size.
+- `RUN_EVIDENCE.json` — exact device fingerprint, QAIRT version, model/dataset revisions, QNN artifact IDs, compile/profile job IDs và representative inference job URLs.
+- `QUALCOMM_JOB_LEDGER.csv` — ledger các Qualcomm inference jobs thành công được ghi trong run, gồm job ID/URL, device, graph, artifact model, batch size.
 - `INFERENCE_SAMPLE_JOB_PROOF.csv` — mapping sample → encoder job ID + last decoder job ID + decoder job count.
 - `SAMPLE_SELECTION.csv` — chính xác các sample đã dùng.
 - `MODEL_METADATA.csv`, `s24_model_speed_memory_profile.csv`.
@@ -39,8 +44,8 @@ ZIP này chứa:
 Các Qualcomm job URL có thể mở khi đăng nhập đúng AI Hub account của nhóm để kiểm chứng job/device.
 
 ## Resume / cache
-Toàn bộ cache, linked model artifacts, profile và per-sample checkpoint nằm trong `qai_asr_s24_benchmark\`. Không xóa thư mục này nếu muốn resume.
+Toàn bộ QNN artifact cache, profile data và per-sample checkpoint nằm trong `qai_asr_s24_benchmark\`. Không xóa thư mục này nếu muốn resume.
 
 - Trước khi tạo Qualcomm job, launcher chạy `pip check`, syntax check và regression preflight.
-- Nếu linked model cũ có producer đã `FAILED`, script tự loại cache đó và compile/link lại thay vì tiếp tục tới profile.
-- Profile lỗi tạm thời không chặn WER/CER và sẽ được retry ở lần chạy sau; inference job lỗi luôn dừng với status và URL Qualcomm cụ thể.
+- Nếu artifact cũ có producer đã `FAILED`, script tự loại cache đó và compile lại QNN DLC thay vì dùng model hỏng.
+- Profile mặc định không chạy. Inference job lỗi được thử lại tối đa 3 lần; nếu vẫn lỗi, console ghi đủ status/URL và lần chạy sau tiếp tục từ checkpoint đã hoàn thành.

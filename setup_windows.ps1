@@ -7,6 +7,19 @@ Write-Host "Working folder: $PSScriptRoot"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
+if (-not $env:QAI_RUN_MODE) {
+    $env:QAI_RUN_MODE = "benchmark"
+}
+if (-not $env:QAI_ARTIFACT_POLICY) {
+    $env:QAI_ARTIFACT_POLICY = "separate_qnn_dlc"
+}
+if (-not $env:QAI_HUB_JOB_RETRIES) {
+    $env:QAI_HUB_JOB_RETRIES = "3"
+}
+if (-not $env:QAI_ENABLE_PROFILING) {
+    $env:QAI_ENABLE_PROFILING = "0"
+}
+
 if (-not $env:QAI_BENCHMARK_ROOT) {
     $env:QAI_BENCHMARK_ROOT = Join-Path $PSScriptRoot "qai_asr_s24_benchmark"
 }
@@ -181,6 +194,9 @@ Write-Host "  Models : Whisper Tiny / Whisper Small / PhoWhisper Base"
 Write-Host "  Device : exact hosted Samsung Galaxy S24"
 Write-Host "  Compute: Qualcomm NPU requested"
 Write-Host "  Samples: 100 per benchmark"
+Write-Host "  Artifact: separate QNN DLC encoder/decoder (no context link required)"
+Write-Host "  Retries: $env:QAI_HUB_JOB_RETRIES per inference job"
+Write-Host "  Profile: disabled (prediction benchmark only)"
 Write-Host ""
 Write-Host "If Qualcomm API token is not configured yet,"
 Write-Host "the benchmark will ask for it."
@@ -218,7 +234,7 @@ Write-Host "  - Qualcomm inference job IDs"
 Write-Host "  - Qualcomm job URLs"
 Write-Host "  - exact Samsung Galaxy S24 device evidence"
 Write-Host "  - sample selection"
-Write-Host "  - latency / memory profile"
+Write-Host "  - optional latency / memory profile fields"
 Write-Host "  - console log"
 Write-Host "  - SHA-256 hashes"
 Write-Host ""
