@@ -42,7 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-status-runtime-v3"
+PATCH_VERSION = "2026-08-20-qnn-dlc-link-fallback-v4"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = "benchmark"       # "smoke", "benchmark", or "full"
@@ -611,19 +611,29 @@ def _normalize_compile_input_spec(spec: Any) -> list[_LocalTensorSpec]:
         out.append(_LocalTensorSpec(name=name, shape=shape, dtype=dtype))
     return out
 
-def inspect_linked_contract(model, cached: dict):
+def inspect_artifact_contract(encoder_model, decoder_model, cached: dict):
     graph_names=cached["graph_names"]
     rows=[]
-    remote_inputs=getattr(model, "input_spec", {}) or {}
-    remote_outputs=getattr(model, "output_spec", {}) or {}
-    for idx,graph in enumerate(graph_names):
+    used_remote_inputs=False
+    used_remote_outputs=False
+    for idx,(graph,model) in enumerate(zip(graph_names,[encoder_model,decoder_model])):
+        remote_inputs=getattr(model, "input_spec", {}) or {}
+        remote_outputs=getattr(model, "output_spec", {}) or {}
         local_input = cached["encoder_input_spec"] if idx==0 else cached["decoder_input_spec"]
         local_outputs = cached["encoder_output_names"] if idx==0 else cached["decoder_output_names"]
-        in_specs=remote_inputs.get(graph) or _normalize_compile_input_spec(local_input)
+        remote_in_specs=remote_inputs.get(graph)
+        if not remote_in_specs and len(remote_inputs)==1 and None in remote_inputs:
+            remote_in_specs=remote_inputs[None]
+        in_specs=remote_in_specs or _normalize_compile_input_spec(local_input)
+        used_remote_inputs=used_remote_inputs or bool(remote_in_specs)
         for t in in_specs:
             rows.append({"graph":graph,"side":"input","name":t.name,"shape":tuple(t.shape),"dtype":str(t.dtype),
-                         "contract_source":"workbench_model_spec" if remote_inputs.get(graph) else "submitted_compile_spec"})
-        out_specs=remote_outputs.get(graph) or []
+                         "contract_source":"workbench_model_spec" if remote_in_specs else "submitted_compile_spec"})
+        out_specs=remote_outputs.get(graph)
+        if not out_specs and len(remote_outputs)==1 and None in remote_outputs:
+            out_specs=remote_outputs[None]
+        out_specs=out_specs or []
+        used_remote_outputs=used_remote_outputs or bool(out_specs)
         if out_specs:
             for t in out_specs:
                 rows.append({"graph":graph,"side":"output","name":t.name,"shape":tuple(t.shape),"dtype":str(t.dtype),
@@ -632,10 +642,10 @@ def inspect_linked_contract(model, cached: dict):
             for name in local_outputs:
                 rows.append({"graph":graph,"side":"output","name":str(name),"shape":None,"dtype":None,
                              "contract_source":"submitted_output_names"})
-    if not remote_inputs:
-        print("NOTE: Workbench returned empty linked input_spec; using the exact input specs submitted at compile time for local validation.")
-    if not remote_outputs:
-        print("NOTE: Workbench returned empty linked output_spec; using the exact --output_names submitted at compile time.")
+    if not used_remote_inputs:
+        print("NOTE: Workbench returned no usable artifact input_spec; using the exact input specs submitted at compile time for local validation.")
+    if not used_remote_outputs:
+        print("NOTE: Workbench returned no usable artifact output_spec; using the exact --output_names submitted at compile time.")
     return pd.DataFrame(rows)
 
 REMOTE_MANIFEST_PATH=ARTIFACT_DIR/"hub_artifacts.json"
@@ -684,6 +694,54 @@ def _require_model_ready(model, label: str):
         )
     return producer
 
+def _link_retry_options(qairt_version: str) -> list[str]:
+    return [
+        f"--qairt_version {qairt_version} --qnn_options default_graph_htp_optimizations=O=2",
+        f"--qairt_version {qairt_version} --qnn_options default_graph_htp_optimizations=O=1",
+    ]
+
+def _retry_link_jobs(client_obj, models, device, name: str, qairt_version: str):
+    attempts=[]
+    for options in _link_retry_options(qairt_version):
+        try:
+            job=client_obj.submit_link_job(models,device=device,name=name,options=options)
+            job_device=getattr(job,"device",None)
+            if job_device is not None and getattr(job_device,"name",None)!=getattr(device,"name",None):
+                raise RuntimeError(f"link retry targeted {job_device}; expected {device}")
+            status=job.wait()
+            success=bool(getattr(status,"success",False))
+            attempt={
+                "job_id":getattr(job,"job_id",None),
+                "job_url":getattr(job,"url",None),
+                "options":options,
+                "status":_status_line(status),
+                "success":success,
+            }
+            print(f"Link retry ({options}): {_status_line(status)} | {getattr(job,'url',None)}")
+            if success:
+                model=job.get_target_model()
+                ready=model is not None and bool(model.wait())
+                attempt["target_model_id"]=getattr(model,"model_id",None)
+                if ready:
+                    attempts.append(attempt)
+                    return job,model,attempts
+                attempt["success"]=False
+                attempt["target_error"]="successful link returned no ready target model"
+            attempts.append(attempt)
+        except Exception as exc:
+            attempts.append({"options":options,"success":False,"error":repr(exc)})
+            print(f"WARNING: link retry submission/execution failed for {options}: {exc!r}")
+    return None,None,attempts
+
+def _cached_artifact_model_ids(cached: dict):
+    mode=cached.get("artifact_mode")
+    if mode=="separate_qnn_dlc":
+        return mode,cached.get("encoder_model_id"),cached.get("decoder_model_id")
+    linked_id=cached.get("linked_model_id")
+    if linked_id:
+        return "linked_context",linked_id,linked_id
+    return mode,cached.get("encoder_model_id"),cached.get("decoder_model_id")
+
 remote_manifest=_safe_json_load(REMOTE_MANIFEST_PATH,{})
 MODEL_ARTIFACTS={}
 
@@ -691,28 +749,39 @@ for label,repo in MODEL_IDS.items():
     print("\n"+"="*100+f"\n{label}")
     key=model_cache_key(label,repo)
     cached=remote_manifest.get(label)
-    linked=None
-    if cached and cached.get("cache_key")==key and cached.get("linked_model_id"):
+    artifact_mode=None
+    encoder_model=None
+    decoder_model=None
+    if cached and cached.get("cache_key")==key:
         try:
-            candidate=client.get_model(cached["linked_model_id"])
-            success,producer,detail=_model_producer_status(candidate)
-            if not success:
-                print(
-                    f"Cached linked model {candidate.model_id} is INVALID because its producer failed; "
-                    f"discarding cache. producer={getattr(producer,'url',None)}; {detail}"
-                )
-                remote_manifest.pop(label,None)
-                atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
-            else:
-                linked=candidate
-                print("Reusing verified linked S24 model:", linked.model_id, linked.url)
+            artifact_mode,encoder_id,decoder_id=_cached_artifact_model_ids(cached)
+            if artifact_mode not in {"linked_context","separate_qnn_dlc"} or not encoder_id or not decoder_id:
+                raise ValueError("cached artifact layout is incomplete")
+            encoder_model=client.get_model(encoder_id)
+            decoder_model=encoder_model if decoder_id==encoder_id else client.get_model(decoder_id)
+            for component,candidate in [("encoder",encoder_model),("decoder",decoder_model)]:
+                success,producer,detail=_model_producer_status(candidate)
+                if not success:
+                    raise RuntimeError(
+                        f"cached {component} model {candidate.model_id} has a failed producer; "
+                        f"producer={getattr(producer,'url',None)}; {detail}"
+                    )
+            cached["artifact_mode"]=artifact_mode
+            cached["encoder_model_id"]=encoder_model.model_id
+            cached["decoder_model_id"]=decoder_model.model_id
+            print(
+                f"Reusing verified S24 artifact ({artifact_mode}): "
+                f"encoder={encoder_model.model_id}, decoder={decoder_model.model_id}"
+            )
         except Exception as exc:
-            print("Cached remote model unavailable/invalid; rebuilding:",repr(exc))
-            linked=None
+            print("Cached remote artifact unavailable/invalid; rebuilding:",repr(exc))
+            artifact_mode=None
+            encoder_model=None
+            decoder_model=None
             remote_manifest.pop(label,None)
             atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
 
-    if linked is None:
+    if encoder_model is None or decoder_model is None:
         meta=export_whisper_components(label,repo)
         graph_names=[f"{slug(label)}_encoder",f"{slug(label)}_decoder"]
         print("Uploading TorchScript source models...")
@@ -753,36 +822,84 @@ for label,repo in MODEL_IDS.items():
                 compile_failures.append((idx,j,st))
         link_status=link_job.wait()
         print(f"Link finished: {_status_line(link_status)} | {link_job.url}")
-        if compile_failures or not bool(getattr(link_status,"success",False)):
+        if compile_failures:
             bits=[]
             for idx,j,st in compile_failures:
                 bits.append(f"compile[{idx}] {j.url}: {_status_line(st)}")
-            if not bool(getattr(link_status,"success",False)):
-                bits.append(f"link {link_job.url}: {_status_line(link_status)}")
             raise RuntimeError(
-                f"Qualcomm compile/link failed for {label}. " + " | ".join(bits)
+                f"Qualcomm compile failed for {label}. " + " | ".join(bits)
             )
 
-        linked=link_job.get_target_model()
+        compiled_models=[]
+        for idx,j in enumerate(compile_jobs):
+            target=j.get_target_model()
+            if target is None or not bool(target.wait()):
+                raise RuntimeError(f"Successful compile[{idx}] returned no ready QNN DLC target model: {j.url}")
+            _require_model_ready(target,f"{label} compile[{idx}]")
+            compiled_models.append(target)
+
+        link_attempts=[{
+            "job_id":link_job.job_id,
+            "job_url":link_job.url,
+            "options":f"--qairt_version {QAIRT_VERSION}",
+            "status":_status_line(link_status),
+            "success":bool(getattr(link_status,"success",False)),
+        }]
+        selected_link_job=None
+        linked=None
+        if bool(getattr(link_status,"success",False)):
+            try:
+                linked=link_job.get_target_model()
+                if linked is not None and bool(linked.wait()):
+                    link_attempts[0]["target_model_id"]=linked.model_id
+                    selected_link_job=link_job
+                else:
+                    link_attempts[0]["success"]=False
+                    link_attempts[0]["target_error"]="successful link returned no ready target model"
+                    linked=None
+            except Exception as exc:
+                link_attempts[0]["success"]=False
+                link_attempts[0]["target_error"]=repr(exc)
+                linked=None
+
         if linked is None:
-            raise RuntimeError(f"Successful link job returned no target model: {link_job.url}")
-        if not linked.wait():
-            raise RuntimeError(f"Linked target model did not become ready despite successful link: {link_job.url}")
-        producer=_require_model_ready(linked,label)
+            print("Initial context-binary link failed; retrying with lower HTP optimization levels O=2 then O=1.")
+            selected_link_job,linked,retries=_retry_link_jobs(
+                client,compiled_models,TARGET_DEVICE,f"{slug(label)}_s24_whisper_link_retry",QAIRT_VERSION
+            )
+            link_attempts.extend(retries)
+
+        if linked is not None:
+            artifact_mode="linked_context"
+            encoder_model=linked
+            decoder_model=linked
+            _require_model_ready(linked,label)
+            print("Using linked QNN context binary:",linked.model_id)
+        else:
+            artifact_mode="separate_qnn_dlc"
+            encoder_model,decoder_model=compiled_models
+            print(
+                "WARNING: all context-binary links failed; using the two successful QNN DLC models "
+                f"directly on the S24 NPU. encoder={encoder_model.model_id}, decoder={decoder_model.model_id}"
+            )
 
         cached={
             "cache_key":key,"repo":repo,"revision":MODEL_REVISIONS[repo],
+            "artifact_mode":artifact_mode,
             "source_encoder_model_id":src_enc.model_id,"source_decoder_model_id":src_dec.model_id,
             "compile_job_ids":[j.job_id for j in compile_jobs],
             "compile_job_urls":[j.url for j in compile_jobs],
-            "link_job_id":link_job.job_id,"link_job_url":link_job.url,
-            "linked_model_id":linked.model_id,"graph_names":graph_names,
+            "link_job_id":getattr(selected_link_job,"job_id",None),
+            "link_job_url":getattr(selected_link_job,"url",None),
+            "initial_link_job_id":link_job.job_id,"initial_link_job_url":link_job.url,
+            "link_attempts":link_attempts,
+            "linked_model_id":linked.model_id if linked is not None else None,
+            "encoder_model_id":encoder_model.model_id,"decoder_model_id":decoder_model.model_id,
+            "graph_names":graph_names,
             "encoder_input_spec":meta["encoder_input_spec"],"decoder_input_spec":meta["decoder_input_spec"],
             "encoder_output_names":meta["encoder_output_names"],"decoder_output_names":meta["decoder_output_names"],
             "config":meta["config"],"snapshot":meta["snapshot"],
         }
-        remote_manifest[label]=cached
-        atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
     else:
         # Rehydrate exact local model contracts from the pinned source revision.
         snap=source_snapshot(repo)
@@ -796,26 +913,36 @@ for label,repo in MODEL_IDS.items():
         cached["decoder_input_spec"]=dec_spec
         del enc,dec,original
         gc.collect()
-        producer=_require_model_ready(linked,label)
-
-    producer_device=getattr(producer,"device",None) if producer is not None else None
-    if producer_device is None or getattr(producer_device,"name",None)!=TARGET_DEVICE_NAME:
-        raise RuntimeError(
-            f"Linked artifact {linked.model_id} is not proven to be produced for exact {TARGET_DEVICE_NAME}: "
-            f"producer={producer}, producer_device={producer_device}"
-        )
-    model_type_text=str(getattr(linked,"model_type","")).lower()
-    if "qnn" not in model_type_text or "context" not in model_type_text:
-        raise RuntimeError(f"Expected QNN Context Binary target model; got {getattr(linked,'model_type',None)}")
-    cached["producer_device"]=producer_device.name
-    cached["linked_model_type"]=str(getattr(linked,"model_type",""))
-    cached["linked_model_metadata"]={str(k):str(v) for k,v in (getattr(linked,"metadata",{}) or {}).items()}
-    contract=inspect_linked_contract(linked,cached)
+    producers={}
+    expected_kind="context" if artifact_mode=="linked_context" else "dlc"
+    for component,model in [("encoder",encoder_model),("decoder",decoder_model)]:
+        producer=_require_model_ready(model,f"{label} {component}")
+        producer_device=getattr(producer,"device",None) if producer is not None else None
+        if producer_device is None or getattr(producer_device,"name",None)!=TARGET_DEVICE_NAME:
+            raise RuntimeError(
+                f"{component.title()} artifact {model.model_id} is not proven to be produced for exact {TARGET_DEVICE_NAME}: "
+                f"producer={producer}, producer_device={producer_device}"
+            )
+        model_type_text=str(getattr(model,"model_type","")).lower()
+        if "qnn" not in model_type_text or expected_kind not in model_type_text:
+            raise RuntimeError(
+                f"Expected QNN {expected_kind} {component} target model; got {getattr(model,'model_type',None)}"
+            )
+        producers[component]=producer_device.name
+        cached[f"{component}_model_type"]=str(getattr(model,"model_type",""))
+        cached[f"{component}_model_metadata"]={str(k):str(v) for k,v in (getattr(model,"metadata",{}) or {}).items()}
+    cached["producer_device"]=TARGET_DEVICE_NAME
+    cached["encoder_producer_device"]=producers["encoder"]
+    cached["decoder_producer_device"]=producers["decoder"]
+    cached["linked_model_type"]=cached.get("encoder_model_type") if artifact_mode=="linked_context" else None
+    contract=inspect_artifact_contract(encoder_model,decoder_model,cached)
     display(contract)
-    MODEL_ARTIFACTS[label]={**cached,"linked_model":linked}
+    MODEL_ARTIFACTS[label]={**cached,"encoder_model":encoder_model,"decoder_model":decoder_model}
+    remote_manifest[label]={kk:vv for kk,vv in MODEL_ARTIFACTS[label].items() if kk not in {"encoder_model","decoder_model"}}
+    atomic_json(remote_manifest,REMOTE_MANIFEST_PATH)
 
-atomic_json({k:{kk:vv for kk,vv in v.items() if kk!="linked_model"} for k,v in MODEL_ARTIFACTS.items()},REMOTE_MANIFEST_PATH)
-print("All three linked model artifacts have SUCCESS producers and are ready on the exact S24 target.")
+atomic_json({k:{kk:vv for kk,vv in v.items() if kk not in {"encoder_model","decoder_model"}} for k,v in MODEL_ARTIFACTS.items()},REMOTE_MANIFEST_PATH)
+print("All optimized model artifacts have SUCCESS producers and are ready on the exact S24 target.")
 
 PROFILE_PATH=ARTIFACT_DIR/"s24_profiles.json"
 profile_cache=_safe_json_load(PROFILE_PATH,{})
@@ -827,6 +954,12 @@ def _profile_cache_needs_refresh(cached_profile, profile_key: str, required: lis
     if cached_profile.get("profile_error"):
         return True
     return any(cached_profile.get(key) is None for key in required)
+
+def _qnn_runtime_options(qairt_version: str, graph: str, artifact_mode: str | None) -> str:
+    options=f"--compute_unit npu --qairt_version {qairt_version}"
+    if artifact_mode!="separate_qnn_dlc":
+        options+=f" --qnn_options context_enable_graphs={graph}"
+    return options
 
 def _find_profile_metric(obj, key):
     if isinstance(obj, dict):
@@ -875,19 +1008,32 @@ def profile_metrics(job):
 
 PROFILE_ROWS=[]
 for label,a in MODEL_ARTIFACTS.items():
-    linked=a["linked_model"]; enc_graph,dec_graph=a["graph_names"]
-    _require_model_ready(linked,label)
-    pkey=f"{linked.model_id}|{TARGET_DEVICE_NAME}|{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}|profile-v2"
+    artifact_mode=a["artifact_mode"]
+    encoder_model=a["encoder_model"]; decoder_model=a["decoder_model"]
+    enc_graph,dec_graph=a["graph_names"]
+    _require_model_ready(encoder_model,f"{label} encoder")
+    _require_model_ready(decoder_model,f"{label} decoder")
+    if artifact_mode=="linked_context":
+        pkey=f"{encoder_model.model_id}|{TARGET_DEVICE_NAME}|{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}|profile-v2"
+    else:
+        pkey=(f"{artifact_mode}|{encoder_model.model_id}|{decoder_model.model_id}|{TARGET_DEVICE_NAME}|"
+              f"{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}|profile-v3")
     cached_profile=profile_cache.get(label)
     required=["encoder_latency_us","decoder_latency_us"]
     needs_refresh=_profile_cache_needs_refresh(cached_profile,pkey,required)
     if needs_refresh:
-        vals={"profile_key":pkey,"linked_model_id":linked.model_id}
+        vals={
+            "profile_key":pkey,
+            "artifact_mode":artifact_mode,
+            "linked_model_id":a.get("linked_model_id"),
+            "encoder_model_id":encoder_model.model_id,
+            "decoder_model_id":decoder_model.model_id,
+        }
         profile_errors=[]
-        for component,graph in [("encoder",enc_graph),("decoder",dec_graph)]:
+        for component,graph,model in [("encoder",enc_graph,encoder_model),("decoder",dec_graph,decoder_model)]:
             try:
-                opts=f"--compute_unit npu --qairt_version {QAIRT_VERSION} --qnn_options context_enable_graphs={graph}"
-                job=client.submit_profile_job(linked,device=TARGET_DEVICE,name=f"{slug(label)}_{component}_s24",options=opts)
+                opts=_qnn_runtime_options(QAIRT_VERSION,graph,artifact_mode)
+                job=client.submit_profile_job(model,device=TARGET_DEVICE,name=f"{slug(label)}_{component}_s24",options=opts)
                 if getattr(getattr(job,"device",None),"name",None)!=TARGET_DEVICE_NAME:
                     raise RuntimeError(f"Profile job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job,'device',None)}")
                 metrics,report=profile_metrics(job)
@@ -916,7 +1062,9 @@ for label,a in MODEL_ARTIFACTS.items():
     mem_values=[x for x in mem_values if x is not None]
     peak_ram_mb=(max(mem_values)/(1024**2)) if mem_values else np.nan
     PROFILE_ROWS.append({
-        "model":label,"linked_model_id":linked.model_id,"device":TARGET_DEVICE_NAME,
+        "model":label,"artifact_mode":artifact_mode,"linked_model_id":a.get("linked_model_id"),
+        "encoder_model_id":encoder_model.model_id,"decoder_model_id":decoder_model.model_id,
+        "device":TARGET_DEVICE_NAME,
         "encoder_ms":enc_ms,"decoder_ms_per_token":dec_ms,
         "encoder_plus_first_decoder_ms":enc_ms+dec_ms if np.isfinite(enc_ms) and np.isfinite(dec_ms) else np.nan,
         "max_200_step_compute_ms":enc_ms+(MEAN_DECODE_LEN-1)*dec_ms if np.isfinite(enc_ms) and np.isfinite(dec_ms) else np.nan,
@@ -953,6 +1101,8 @@ for _label,_a in MODEL_ARTIFACTS.items():
 def graph_input_specs(model,graph):
     remote=getattr(model,"input_spec",{}) or {}
     specs=remote.get(graph)
+    if not specs and len(remote)==1 and None in remote:
+        specs=remote[None]
     if specs:
         return list(specs)
     if graph not in GRAPH_CONTRACTS:
@@ -962,6 +1112,8 @@ def graph_input_specs(model,graph):
 def graph_output_names(model,graph):
     remote=getattr(model,"output_spec",{}) or {}
     specs=remote.get(graph)
+    if not specs and len(remote)==1 and None in remote:
+        specs=remote[None]
     if specs:
         return [t.name for t in specs]
     if graph not in GRAPH_CONTRACTS:
@@ -975,7 +1127,9 @@ def cast_for_tensor(arr: np.ndarray, ts):
         raise ValueError(f"{ts.name}: got shape {x.shape}, expected {expected}")
     return np.ascontiguousarray(x)
 
-def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_name: str):
+def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_name: str,
+                artifact_mode: str | None=None, component: str | None=None,
+                linked_model_id: str | None=None):
     if not examples: return [],0.0,None
     ins=graph_input_specs(model,graph)
     expected_names=[t.name for t in ins]
@@ -983,7 +1137,7 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
         if set(ex)!=set(expected_names):
             raise KeyError(f"{graph} input mismatch: expected {expected_names}; got {list(ex)}")
     payload={t.name:[cast_for_tensor(ex[t.name],t) for ex in examples] for t in ins}
-    opts=f"--compute_unit npu --qairt_version {QAIRT_VERSION} --qnn_options context_enable_graphs={graph}"
+    opts=_qnn_runtime_options(QAIRT_VERSION,graph,artifact_mode)
     t0=time.perf_counter()
     job=client.submit_inference_job(model=model,device=TARGET_DEVICE,inputs=payload,name=job_name,options=opts)
     if getattr(getattr(job, "device", None), "name", None) != TARGET_DEVICE_NAME:
@@ -1013,7 +1167,10 @@ def infer_graph(model, graph: str, examples: list[dict[str,np.ndarray]], job_nam
         "job_url": job.url,
         "job_name": job_name,
         "device": getattr(getattr(job, "device", None), "name", None),
-        "linked_model_id": getattr(model, "model_id", None),
+        "artifact_mode": artifact_mode,
+        "component": component,
+        "artifact_model_id": getattr(model, "model_id", None),
+        "linked_model_id": linked_model_id,
         "graph": graph,
         "batch_size": len(examples),
         "compute_unit_requested": "npu",
@@ -1034,7 +1191,8 @@ class DecodeState:
 
 class S24WhisperRuntime:
     def __init__(self,label: str):
-        self.label=label; self.a=MODEL_ARTIFACTS[label]; self.model=self.a["linked_model"]
+        self.label=label; self.a=MODEL_ARTIFACTS[label]
+        self.encoder_model=self.a["encoder_model"]; self.decoder_model=self.a["decoder_model"]
         self.enc_graph,self.dec_graph=self.a["graph_names"]
         self.snapshot=self.a["snapshot"]
         self.processor=AutoProcessor.from_pretrained(self.snapshot)
@@ -1043,11 +1201,11 @@ class S24WhisperRuntime:
         self.config=WhisperConfig.from_dict(self.a["config"])
         self.enc_out_names=self.a["encoder_output_names"]
         self.dec_out_names=self.a["decoder_output_names"]
-        if set(graph_output_names(self.model,self.enc_graph)) != set(self.enc_out_names):
+        if set(graph_output_names(self.encoder_model,self.enc_graph)) != set(self.enc_out_names):
             raise RuntimeError("Encoder target output names differ from Qualcomm source contract")
-        if set(graph_output_names(self.model,self.dec_graph)) != set(self.dec_out_names):
+        if set(graph_output_names(self.decoder_model,self.dec_graph)) != set(self.dec_out_names):
             raise RuntimeError("Decoder target output names differ from Qualcomm source contract")
-        self.dec_input_spec={t.name:t for t in graph_input_specs(self.model,self.dec_graph)}
+        self.dec_input_spec={t.name:t for t in graph_input_specs(self.decoder_model,self.dec_graph)}
         expected_dec={"logits"} | {f"{p}_cache_self_{i}_out" for i in range(self.config.decoder_layers) for p in ("k","v")}
         if set(self.dec_out_names)!=expected_dec:
             raise RuntimeError(f"Unexpected Qualcomm Whisper decoder outputs for {label}: {self.dec_out_names}")
@@ -1094,7 +1252,10 @@ class S24WhisperRuntime:
             if tuple(f.shape)!=(1,self.config.num_mel_bins,3000):
                 raise RuntimeError(f"Unexpected Whisper features {f.shape}")
             features.append({"input_features":f})
-        enc_values,enc_wall,enc_job=infer_graph(self.model,self.enc_graph,features,f"{slug(self.label)}_{batch_tag}_enc")
+        enc_values,enc_wall,enc_job=infer_graph(
+            self.encoder_model,self.enc_graph,features,f"{slug(self.label)}_{batch_tag}_enc",
+            artifact_mode=self.a["artifact_mode"],component="encoder",linked_model_id=self.a.get("linked_model_id")
+        )
         states=[self._new_state(v) for v in enc_values]
         forced=self.forced_prompt(language)
         first_free=max(forced.keys(),default=0)+1
@@ -1113,7 +1274,10 @@ class S24WhisperRuntime:
                 ex={"input_ids":np.array([[s.tokens[-1]]],dtype=np.int32),"attention_mask":s.attention_mask}
                 ex.update(s.self_cache); ex.update(s.cross_cache); ex["position_ids"]=s.position_ids
                 inputs.append(ex)
-            outs,wall,jid=infer_graph(self.model,self.dec_graph,inputs,f"{slug(self.label)}_{batch_tag}_dec_{n:03d}")
+            outs,wall,jid=infer_graph(
+                self.decoder_model,self.dec_graph,inputs,f"{slug(self.label)}_{batch_tag}_dec_{n:03d}",
+                artifact_mode=self.a["artifact_mode"],component="decoder",linked_model_id=self.a.get("linked_model_id")
+            )
             decoder_wall+=wall; decoder_jobs.append(jid)
             for state_idx,vals in zip(active,outs):
                 s=states[state_idx]
@@ -1172,11 +1336,20 @@ def validate_wave(x,sr):
 
 def checkpoint_signature(benchmark_id,label,dataset_revision,language):
     a=MODEL_ARTIFACTS[label]
-    payload={"benchmark":benchmark_id,"model":label,"model_revision":a["revision"],"linked_model_id":a["linked_model"].model_id,
-             "dataset_revision":dataset_revision,"language":language,"decode_len":MEAN_DECODE_LEN,
-             "target_device":TARGET_DEVICE_NAME,"device_fingerprint":DEVICE_FINGERPRINT,
-             "qairt_api_version":QAIRT_VERSION,"qairt_full_version":QAIRT_FULL_VERSION,
-             "prediction_contract_version":"2026-08-unified-v2"}
+    if a["artifact_mode"]=="linked_context":
+        payload={"benchmark":benchmark_id,"model":label,"model_revision":a["revision"],"linked_model_id":a["encoder_model"].model_id,
+                 "dataset_revision":dataset_revision,"language":language,"decode_len":MEAN_DECODE_LEN,
+                 "target_device":TARGET_DEVICE_NAME,"device_fingerprint":DEVICE_FINGERPRINT,
+                 "qairt_api_version":QAIRT_VERSION,"qairt_full_version":QAIRT_FULL_VERSION,
+                 "prediction_contract_version":"2026-08-unified-v2"}
+    else:
+        payload={"benchmark":benchmark_id,"model":label,"model_revision":a["revision"],
+                 "artifact_mode":a["artifact_mode"],"encoder_model_id":a["encoder_model"].model_id,
+                 "decoder_model_id":a["decoder_model"].model_id,
+                 "dataset_revision":dataset_revision,"language":language,"decode_len":MEAN_DECODE_LEN,
+                 "target_device":TARGET_DEVICE_NAME,"device_fingerprint":DEVICE_FINGERPRINT,
+                 "qairt_api_version":QAIRT_VERSION,"qairt_full_version":QAIRT_FULL_VERSION,
+                 "prediction_contract_version":"2026-08-component-artifacts-v3"}
     return hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest(),payload
 
 def run_predictions(benchmark_id:str, metadata:pd.DataFrame, wave_getter, language:str, dataset_revision:str):
@@ -1217,8 +1390,12 @@ def run_predictions(benchmark_id:str, metadata:pd.DataFrame, wave_getter, langua
                 est_ms=(prof["encoder_ms"]+pred["decode_steps"]*prof["decoder_ms_per_token"]
                         if np.isfinite(prof.get("encoder_ms",np.nan)) and np.isfinite(prof.get("decoder_ms_per_token",np.nan))
                         else np.nan)
+                artifact=MODEL_ARTIFACTS[label]
                 rows.append({"sample_key":r.sample_key,"model":label,**pred,"estimated_device_compute_ms":est_ms,
-                             "linked_model_id":MODEL_ARTIFACTS[label]["linked_model"].model_id})
+                             "artifact_mode":artifact["artifact_mode"],
+                             "encoder_model_id":artifact["encoder_model"].model_id,
+                             "decoder_model_id":artifact["decoder_model"].model_id,
+                             "linked_model_id":artifact.get("linked_model_id")})
             frame=pd.DataFrame(rows)
             # stable output order follows metadata, regardless of prior smoke/full order.
             order={k:i for i,k in enumerate(metadata.sample_key.astype(str))}
@@ -1553,8 +1730,10 @@ if RUN["vimedcss_codeswitch"]:
 
 MODEL_METADATA_DF=pd.DataFrame([{
     "model":label,"hf_repo":MODEL_IDS[label],"hf_revision":MODEL_REVISIONS[MODEL_IDS[label]],
-    "linked_model_id":a["linked_model"].model_id,"producer_device":a.get("producer_device"),
-    "linked_model_type":a.get("linked_model_type"),"qairt_api_version":QAIRT_VERSION,"qairt_full_version":QAIRT_FULL_VERSION,
+    "artifact_mode":a["artifact_mode"],"linked_model_id":a.get("linked_model_id"),
+    "encoder_model_id":a["encoder_model"].model_id,"decoder_model_id":a["decoder_model"].model_id,
+    "producer_device":a.get("producer_device"),"encoder_model_type":a.get("encoder_model_type"),
+    "decoder_model_type":a.get("decoder_model_type"),"qairt_api_version":QAIRT_VERSION,"qairt_full_version":QAIRT_FULL_VERSION,
     "encoder_graph":a["graph_names"][0],"decoder_graph":a["graph_names"][1],
 } for label,a in MODEL_ARTIFACTS.items()])
 MODEL_METADATA_DF.to_csv(RESULT_DIR/"MODEL_METADATA.csv",index=False)
@@ -1611,7 +1790,11 @@ inventory={
         "vimd_regions": (VIMD_META.region.value_counts().to_dict() if VIMD_META is not None else {}),
         "vimedcss_test": int((VIMED_DET.split.astype(str)=="test").sum()/len(MODEL_IDS)) if "VIMED_DET" in globals() else 0,
     },
-    "linked_models":{label:{"linked_model_id":a["linked_model"].model_id,"graphs":a["graph_names"]} for label,a in MODEL_ARTIFACTS.items()},
+    "optimized_artifacts":{label:{
+        "artifact_mode":a["artifact_mode"],"linked_model_id":a.get("linked_model_id"),
+        "encoder_model_id":a["encoder_model"].model_id,"decoder_model_id":a["decoder_model"].model_id,
+        "graphs":a["graph_names"],
+    } for label,a in MODEL_ARTIFACTS.items()},
     "profile_rows":PROFILE_DF.to_dict("records"),
     "final_table":str(FINAL_UPLOAD_PATH),
     "result_dir":str(RESULT_DIR),
@@ -1657,7 +1840,8 @@ for cp in sorted(CHECKPOINT_DIR.glob("*.csv")):
         df=pd.read_csv(cp,keep_default_na=False)
     except Exception:
         continue
-    needed=[c for c in ["sample_key","model","linked_model_id","encoder_job_id","last_decoder_job_id","decoder_job_count","decode_steps","truncated"] if c in df.columns]
+    needed=[c for c in ["sample_key","model","artifact_mode","encoder_model_id","decoder_model_id","linked_model_id",
+                         "encoder_job_id","last_decoder_job_id","decoder_job_count","decode_steps","truncated"] if c in df.columns]
     if needed:
         part=df[needed].copy()
         part.insert(0,"checkpoint_file",cp.name)
@@ -1692,19 +1876,28 @@ run_finished_utc=datetime.now(timezone.utc).isoformat()
 compile_link_evidence={}
 for label,a in MODEL_ARTIFACTS.items():
     compile_link_evidence[label]={
+        "artifact_mode":a.get("artifact_mode"),
         "linked_model_id":a.get("linked_model_id"),
         "linked_model_type":a.get("linked_model_type"),
+        "encoder_model_id":a.get("encoder_model_id"),
+        "decoder_model_id":a.get("decoder_model_id"),
+        "encoder_model_type":a.get("encoder_model_type"),
+        "decoder_model_type":a.get("decoder_model_type"),
         "producer_device":a.get("producer_device"),
         "compile_job_ids":a.get("compile_job_ids",[]),
         "compile_job_urls":a.get("compile_job_urls",[]),
         "link_job_id":a.get("link_job_id"),
         "link_job_url":a.get("link_job_url"),
+        "initial_link_job_id":a.get("initial_link_job_id"),
+        "initial_link_job_url":a.get("initial_link_job_url"),
+        "link_attempts":a.get("link_attempts",[]),
         "graphs":a.get("graph_names",[]),
     }
 
 representative_jobs=[]
 if not ledger_df.empty:
-    keep=[c for c in ["job_id","job_url","job_name","device","linked_model_id","graph","batch_size","compute_unit_requested","qairt_api_version"] if c in ledger_df.columns]
+    keep=[c for c in ["job_id","job_url","job_name","device","artifact_mode","component","artifact_model_id",
+                      "linked_model_id","graph","batch_size","compute_unit_requested","qairt_api_version"] if c in ledger_df.columns]
     if keep:
         rep=pd.concat([ledger_df.head(5),ledger_df.tail(5)],ignore_index=True).drop_duplicates(subset=["job_id"])
         representative_jobs=rep[keep].to_dict("records")
@@ -1749,11 +1942,11 @@ readme_evidence=RESULT_DIR/"README_EVIDENCE.txt"
 readme_evidence.write_text(
     "QUALCOMM S24 BENCHMARK EVIDENCE\n\n"
     "1) FINAL_BENCHMARK_TABLE.csv: final metrics.\n"
-    "2) RUN_EVIDENCE.json: exact S24 device fingerprint, model/dataset revisions, linked model IDs, compile/link/profile job IDs and representative inference job URLs.\n"
-    "3) QUALCOMM_JOB_LEDGER.csv: every successful Qualcomm inference job recorded during this run, including job ID/URL, exact device, graph, linked model and batch size.\n"
+    "2) RUN_EVIDENCE.json: exact S24 device fingerprint, model/dataset revisions, optimized artifact IDs, compile/link/profile job IDs and representative inference job URLs.\n"
+    "3) QUALCOMM_JOB_LEDGER.csv: every successful Qualcomm inference job recorded during this run, including job ID/URL, exact device, graph, artifact model and batch size.\n"
     "4) INFERENCE_SAMPLE_JOB_PROOF.csv: per-sample encoder and final decoder Qualcomm job IDs from resumable checkpoints.\n"
     "5) SAMPLE_SELECTION.csv: exact fixed samples used for evaluation.\n"
-    "6) MODEL_METADATA.csv and s24_model_speed_memory_profile.csv: linked artifacts and S24 profile evidence.\n"
+    "6) MODEL_METADATA.csv and s24_model_speed_memory_profile.csv: linked-context or separate-QNN-DLC artifacts and S24 profile evidence.\n"
     "7) RUN_CONSOLE.log: local console audit log (API token is never echoed or stored).\n\n"
     "Open the Qualcomm job URLs while signed into the team's AI Hub account to independently inspect the jobs.\n",
     encoding="utf-8"

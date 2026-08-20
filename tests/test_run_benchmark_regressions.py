@@ -92,6 +92,7 @@ class InferenceStatusTests(unittest.TestCase):
         funcs = load_functions(
             "_status_line",
             "_wait_job_success",
+            "_qnn_runtime_options",
             "infer_graph",
             extra_globals=self._globals(job, evidence),
         )
@@ -121,6 +122,7 @@ class InferenceStatusTests(unittest.TestCase):
         funcs = load_functions(
             "_status_line",
             "_wait_job_success",
+            "_qnn_runtime_options",
             "infer_graph",
             extra_globals=self._globals(job, evidence),
         )
@@ -142,6 +144,140 @@ class InferenceStatusTests(unittest.TestCase):
 
 
 class CacheAndDependencyTests(unittest.TestCase):
+    def test_single_graph_qnn_dlc_uses_remote_none_keyed_contract(self):
+        input_tensor = SimpleNamespace(name="input_features", shape=(1, 80, 3000), dtype="float16")
+        output_tensor = SimpleNamespace(name="k_cache_cross_0", shape=(1,), dtype="float16")
+        funcs = load_functions(
+            "graph_input_specs",
+            "graph_output_names",
+            extra_globals={"GRAPH_CONTRACTS": {}},
+        )
+        model = SimpleNamespace(
+            input_spec={None: [input_tensor]},
+            output_spec={None: [output_tensor]},
+        )
+
+        self.assertEqual(funcs["graph_input_specs"](model, "whisper_small_encoder"), [input_tensor])
+        self.assertEqual(funcs["graph_output_names"](model, "whisper_small_encoder"), ["k_cache_cross_0"])
+
+    def test_separate_qnn_dlc_runtime_does_not_select_a_context_graph(self):
+        funcs = load_functions("_qnn_runtime_options")
+
+        self.assertEqual(
+            funcs["_qnn_runtime_options"]("2.49", "encoder", "separate_qnn_dlc"),
+            "--compute_unit npu --qairt_version 2.49",
+        )
+        self.assertIn(
+            "context_enable_graphs=encoder",
+            funcs["_qnn_runtime_options"]("2.49", "encoder", "linked_context"),
+        )
+
+    def test_link_retry_drops_htp_optimization_before_dlc_fallback(self):
+        funcs = load_functions("_link_retry_options")
+        self.assertIn("_link_retry_options", funcs)
+
+        self.assertEqual(
+            funcs["_link_retry_options"]("2.49"),
+            [
+                "--qairt_version 2.49 --qnn_options default_graph_htp_optimizations=O=2",
+                "--qairt_version 2.49 --qnn_options default_graph_htp_optimizations=O=1",
+            ],
+        )
+
+    def test_link_retry_returns_first_successful_context_binary(self):
+        target_model = SimpleNamespace(model_id="mm_context", wait=lambda: True)
+        failed_job = SimpleNamespace(
+            job_id="jp_o2",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_o2",
+            wait=lambda: FakeStatus(success=False, code="FAILED"),
+            get_target_model=lambda: None,
+        )
+        successful_job = SimpleNamespace(
+            job_id="jp_o1",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_o1",
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            get_target_model=lambda: target_model,
+        )
+        submitted_options = []
+        jobs = iter([failed_job, successful_job])
+
+        def submit_link_job(models, *, device, name, options):
+            submitted_options.append(options)
+            return next(jobs)
+
+        funcs = load_functions(
+            "_status_line",
+            "_link_retry_options",
+            "_retry_link_jobs",
+        )
+        job, model, attempts = funcs["_retry_link_jobs"](
+            SimpleNamespace(submit_link_job=submit_link_job),
+            [SimpleNamespace(model_id="mm_encoder"), SimpleNamespace(model_id="mm_decoder")],
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "whisper_small_s24_whisper",
+            "2.49",
+        )
+
+        self.assertIs(job, successful_job)
+        self.assertIs(model, target_model)
+        self.assertEqual([attempt["success"] for attempt in attempts], [False, True])
+        self.assertIn("O=2", submitted_options[0])
+        self.assertIn("O=1", submitted_options[1])
+
+    def test_link_retry_continues_after_submission_error(self):
+        target_model = SimpleNamespace(model_id="mm_context", wait=lambda: True)
+        successful_job = SimpleNamespace(
+            job_id="jp_o1",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_o1",
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            get_target_model=lambda: target_model,
+        )
+        calls = 0
+
+        def submit_link_job(models, *, device, name, options):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary submit failure")
+            return successful_job
+
+        funcs = load_functions(
+            "_status_line",
+            "_link_retry_options",
+            "_retry_link_jobs",
+        )
+        job, model, attempts = funcs["_retry_link_jobs"](
+            SimpleNamespace(submit_link_job=submit_link_job),
+            [SimpleNamespace(model_id="mm_encoder"), SimpleNamespace(model_id="mm_decoder")],
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "whisper_small_s24_whisper",
+            "2.49",
+        )
+
+        self.assertIs(job, successful_job)
+        self.assertIs(model, target_model)
+        self.assertEqual([attempt["success"] for attempt in attempts], [False, True])
+        self.assertIn("temporary submit failure", attempts[0]["error"])
+
+    def test_cache_supports_separate_qnn_dlc_component_models(self):
+        funcs = load_functions("_cached_artifact_model_ids")
+        self.assertIn("_cached_artifact_model_ids", funcs)
+
+        self.assertEqual(
+            funcs["_cached_artifact_model_ids"](
+                {
+                    "artifact_mode": "separate_qnn_dlc",
+                    "encoder_model_id": "mm_encoder",
+                    "decoder_model_id": "mm_decoder",
+                }
+            ),
+            ("separate_qnn_dlc", "mm_encoder", "mm_decoder"),
+        )
+        self.assertEqual(
+            funcs["_cached_artifact_model_ids"]({"linked_model_id": "mm_linked"}),
+            ("linked_context", "mm_linked", "mm_linked"),
+        )
+
     def test_failed_profile_cache_is_retried(self):
         funcs = load_functions("_profile_cache_needs_refresh")
         self.assertIn("_profile_cache_needs_refresh", funcs)
