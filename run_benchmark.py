@@ -42,26 +42,25 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-complete-table-guard-v7"
+PATCH_VERSION = "2026-08-20-fast50-profile-context-fallback-v9"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = os.environ.get("QAI_RUN_MODE", "benchmark").strip().lower()
-BENCHMARK_N = 100            # 100 samples for each benchmark category
+BENCHMARK_N = 50             # 50 samples for each benchmark category
 SMOKE_N = 3
 SMOKE_VIMD_PER_REGION = 2
 
-# ViMD must still expose all 3 regional columns while keeping 100 utterances total.
-# 34 + 33 + 33 = 100.
-VIMD_BENCHMARK_REGION_TARGETS = {"North": 34, "Central": 33, "South": 33}
+# ViMD still exposes all 3 regional columns while keeping 50 utterances total.
+# 17 + 17 + 16 = 50.
+VIMD_BENCHMARK_REGION_TARGETS = {"North": 17, "Central": 17, "South": 16}
 
 # Code-switch table uses the official ViMedCSS test split. Set True only if you
-# explicitly also want another 100 from the harder diagnostic split.
+# explicitly also want another 50 from the harder diagnostic split.
 VIMEDCSS_INCLUDE_HARD = False
 
-# Qualcomm job optimization: two independent utterances are packed into one
-# Workbench inference job. If a 2-sample payload fails, code automatically
-# retries as single-sample jobs without changing any prediction logic.
-HUB_MICROBATCH = 2
+# Pack independent utterances into one Workbench job. Colab can request a
+# larger batch; adaptive splitting preserves the same predictions if it fails.
+HUB_MICROBATCH = max(1, int(os.environ.get("QAI_HUB_MICROBATCH", "2")))
 HUB_JOB_RETRIES = max(1, int(os.environ.get("QAI_HUB_JOB_RETRIES", "3")))
 ARTIFACT_BUILD_POLICY = os.environ.get("QAI_ARTIFACT_POLICY", "separate_qnn_dlc").strip().lower()
 ENABLE_PROFILING = os.environ.get("QAI_ENABLE_PROFILING", "1").strip().lower() in {"1", "true", "yes"}
@@ -99,11 +98,11 @@ else:
     # Laptop: override with QAI_BENCHMARK_ROOT if desired.
     WORK_ROOT = Path(os.environ.get("QAI_BENCHMARK_ROOT", str(Path.cwd() / "qai_asr_s24_benchmark"))).expanduser().resolve()
 
-HF_HOME = WORK_ROOT / "hf_cache"
+HF_HOME = Path(os.environ.get("QAI_HF_HOME", str(WORK_ROOT / "hf_cache"))).expanduser().resolve()
 ARTIFACT_DIR = WORK_ROOT / "qualcomm_artifacts"
 CHECKPOINT_DIR = WORK_ROOT / "checkpoints"
 RESULT_DIR = WORK_ROOT / "results" / RUN_MODE
-DATA_DIR = WORK_ROOT / "data"
+DATA_DIR = Path(os.environ.get("QAI_DATA_ROOT", str(WORK_ROOT / "data"))).expanduser().resolve()
 for p in [HF_HOME, ARTIFACT_DIR, CHECKPOINT_DIR, RESULT_DIR, DATA_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 os.environ["HF_HOME"] = str(HF_HOME)
@@ -1104,12 +1103,15 @@ def profile_metrics(job):
 
 def _run_profile_job_with_retries(client_obj, model, device, name: str, options: str,
                                   target_device_name: str, max_attempts: int):
+    option_candidates=_profile_runtime_option_candidates(options)
+    option_index=0
     failures=[]
     for attempt in range(1,max_attempts+1):
         job=None
+        attempt_options=option_candidates[option_index]
         try:
             job=client_obj.submit_profile_job(
-                model,device=device,name=name,options=options
+                model,device=device,name=name,options=attempt_options
             )
             if getattr(getattr(job,"device",None),"name",None)!=target_device_name:
                 raise RuntimeError(
@@ -1123,13 +1125,101 @@ def _run_profile_job_with_retries(client_obj, model, device, name: str, options:
             )
             return job,metrics,report
         except Exception as exc:
-            detail=f"attempt {attempt}: job={getattr(job,'url',None)} error={exc!r}"
+            detail=(f"attempt {attempt}: options={attempt_options!r} "
+                    f"job={getattr(job,'url',None)} error={exc!r}")
             failures.append(detail)
+            if _is_memory_allocation_error(exc) and option_index+1<len(option_candidates):
+                option_index+=1
             if attempt<max_attempts:
                 print(f"WARNING: profile {name} failed; retrying. {detail}")
     raise RuntimeError(
         f"Profile {name} failed after {max_attempts} attempts. " + " | ".join(failures)
     )
+
+def _is_memory_allocation_error(exc) -> bool:
+    message=str(exc).upper()
+    return "QNN_COMMON_ERROR_MEM_ALLOC" in message or "MEMORY ALLOCATION" in message
+
+def _profile_runtime_option_candidates(options: str) -> list[str]:
+    candidates=[options]
+    vtcm_option="default_graph_htp_vtcm_size=0"
+    if vtcm_option in options:
+        return candidates
+    if "--qnn_options" in options:
+        # AI Hub separates multiple QNN sub-options with semicolons.
+        candidates.append(options+f";{vtcm_option}")
+    else:
+        candidates.append(options+f" --qnn_options {vtcm_option}")
+    return candidates
+
+def _compile_single_graph_profile_context(client_obj, source_model, input_spec, output_names,
+                                          graph_name: str, device, name: str,
+                                          qairt_version: str):
+    common=f"--quantize_full_type float16 --quantize_io --qairt_version {qairt_version}"
+    compile_jobs,link_job=client_obj.submit_compile_and_link_jobs(
+        models=[source_model],
+        device=device,
+        name=name,
+        input_specs=[input_spec],
+        graph_names=[graph_name],
+        compile_options=[f"--output_names {','.join(output_names)} {common}"],
+        link_options=f"--qairt_version {qairt_version}",
+    )
+    if len(compile_jobs)!=1 or link_job is None:
+        raise RuntimeError("Single-graph profile fallback returned an incomplete compile/link job set")
+    for job in [compile_jobs[0],link_job]:
+        job_device=getattr(job,"device",None)
+        if job_device is not None and getattr(job_device,"name",None)!=getattr(device,"name",None):
+            raise RuntimeError(f"Profile fallback targeted {job_device}; expected {device}")
+
+    compile_status=compile_jobs[0].wait()
+    print(f"Profile fallback compile: {_status_line(compile_status)} | {compile_jobs[0].url}")
+    if not bool(getattr(compile_status,"success",False)):
+        raise RuntimeError(
+            f"Profile fallback compile FAILED: {_status_line(compile_status)} | {compile_jobs[0].url}"
+        )
+    compiled_model=compile_jobs[0].get_target_model()
+    if compiled_model is None or not bool(compiled_model.wait()):
+        raise RuntimeError(f"Profile fallback compile returned no ready model: {compile_jobs[0].url}")
+
+    link_status=link_job.wait()
+    print(f"Profile fallback link: {_status_line(link_status)} | {link_job.url}")
+    link_attempts=[{
+        "job_id":link_job.job_id,
+        "job_url":link_job.url,
+        "options":f"--qairt_version {qairt_version}",
+        "status":_status_line(link_status),
+        "success":bool(getattr(link_status,"success",False)),
+    }]
+    target_model=None
+    selected_link_job=None
+    if bool(getattr(link_status,"success",False)):
+        target_model=link_job.get_target_model()
+        if target_model is not None and bool(target_model.wait()):
+            selected_link_job=link_job
+        else:
+            target_model=None
+            link_attempts[0]["success"]=False
+            link_attempts[0]["target_error"]="successful link returned no ready target model"
+    if target_model is None:
+        selected_link_job,target_model,retries=_retry_link_jobs(
+            client_obj,[compiled_model],device,name+"_link_retry",qairt_version
+        )
+        link_attempts.extend(retries)
+    if target_model is None or not bool(target_model.wait()):
+        raise RuntimeError(
+            "Single-graph QNN context-binary profile fallback failed. "
+            + " | ".join(str(row) for row in link_attempts)
+        )
+    return target_model,{
+        "profile_artifact_mode":"single_graph_qnn_context_binary",
+        "profile_model_id":target_model.model_id,
+        "profile_compile_job_ids":[job.job_id for job in compile_jobs],
+        "profile_compile_job_urls":[job.url for job in compile_jobs],
+        "profile_link_job_id":getattr(selected_link_job,"job_id",None),
+        "profile_link_job_url":getattr(selected_link_job,"url",None),
+        "profile_link_attempts":link_attempts,
+    }
 
 def _validate_required_profile_rows(rows, required_models):
     rows_by_model={row.get("model"):row for row in rows}
@@ -1215,11 +1305,71 @@ for label,a in MODEL_ARTIFACTS.items():
                 print(f"Reusing completed S24 profile for {label}/{component}.")
                 continue
             try:
-                opts=_qnn_runtime_options(QAIRT_VERSION,graph,artifact_mode)
-                job,metrics,report=_run_profile_job_with_retries(
-                    client,model,TARGET_DEVICE,f"{slug(label)}_{component}_s24",opts,
-                    TARGET_DEVICE_NAME,HUB_JOB_RETRIES
-                )
+                profile_model=model
+                profile_artifact_mode=artifact_mode
+                cached_profile_model_id=vals.get(f"{component}_profile_model_id")
+                if (vals.get(f"{component}_profile_artifact_mode")=="single_graph_qnn_context_binary"
+                        and cached_profile_model_id):
+                    try:
+                        cached_profile_model=client.get_model(cached_profile_model_id)
+                        _require_model_ready(cached_profile_model,f"{label} {component} profile fallback")
+                        profile_model=cached_profile_model
+                        profile_artifact_mode="single_graph_qnn_context_binary"
+                        print(f"Reusing single-graph context profile artifact for {label}/{component}: {cached_profile_model_id}")
+                    except Exception as cache_exc:
+                        print(f"Cached profile fallback unavailable for {label}/{component}: {cache_exc!r}")
+
+                opts=_qnn_runtime_options(QAIRT_VERSION,graph,profile_artifact_mode)
+                try:
+                    job,metrics,report=_run_profile_job_with_retries(
+                        client,profile_model,TARGET_DEVICE,f"{slug(label)}_{component}_s24",opts,
+                        TARGET_DEVICE_NAME,HUB_JOB_RETRIES
+                    )
+                except Exception as initial_profile_exc:
+                    can_fallback=(
+                        artifact_mode=="separate_qnn_dlc"
+                        and profile_artifact_mode==artifact_mode
+                        and _is_memory_allocation_error(initial_profile_exc)
+                    )
+                    if not can_fallback:
+                        raise
+                    print(
+                        f"QNN DLC profile hit deterministic memory allocation failure for {label}/{component}; "
+                        "compiling one graph to an S24-specific context binary for profiling only."
+                    )
+                    source_model_id=a.get(f"source_{component}_model_id")
+                    if not source_model_id:
+                        raise RuntimeError(
+                            f"Missing source model ID for {label}/{component} profile fallback"
+                        ) from initial_profile_exc
+                    source_model=client.get_model(source_model_id)
+                    if source_model is None or not bool(source_model.wait()):
+                        raise RuntimeError(
+                            f"Source model {source_model_id} is unavailable for profile fallback"
+                        ) from initial_profile_exc
+                    profile_model,fallback_evidence=_compile_single_graph_profile_context(
+                        client,
+                        source_model,
+                        a[f"{component}_input_spec"],
+                        a[f"{component}_output_names"],
+                        graph,
+                        TARGET_DEVICE,
+                        f"{slug(label)}_{component}_profile_context",
+                        QAIRT_VERSION,
+                    )
+                    for key,value in fallback_evidence.items():
+                        vals[f"{component}_{key}"]=value
+                    profile_cache[label]=vals
+                    atomic_json(profile_cache,PROFILE_PATH)
+                    profile_artifact_mode="single_graph_qnn_context_binary"
+                    opts=_qnn_runtime_options(QAIRT_VERSION,graph,profile_artifact_mode)
+                    job,metrics,report=_run_profile_job_with_retries(
+                        client,profile_model,TARGET_DEVICE,
+                        f"{slug(label)}_{component}_s24_context_profile",opts,
+                        TARGET_DEVICE_NAME,HUB_JOB_RETRIES
+                    )
+                vals[f"{component}_profile_artifact_mode"]=profile_artifact_mode
+                vals[f"{component}_profile_model_id"]=profile_model.model_id
                 vals[f"{component}_profile_job_id"]=job.job_id
                 vals[f"{component}_profile_url"]=job.url
                 vals[f"{component}_latency_us"]=metrics["latency_us"]
@@ -1259,6 +1409,10 @@ for label,a in MODEL_ARTIFACTS.items():
         "peak_ram_mb":peak_ram_mb,
         "encoder_inference_peak_memory_mb":(v.get("encoder_inference_peak_memory_bytes")/(1024**2)) if v.get("encoder_inference_peak_memory_bytes") is not None else np.nan,
         "decoder_inference_peak_memory_mb":(v.get("decoder_inference_peak_memory_bytes")/(1024**2)) if v.get("decoder_inference_peak_memory_bytes") is not None else np.nan,
+        "encoder_profile_artifact_mode":v.get("encoder_profile_artifact_mode"),
+        "decoder_profile_artifact_mode":v.get("decoder_profile_artifact_mode"),
+        "encoder_profile_model_id":v.get("encoder_profile_model_id"),
+        "decoder_profile_model_id":v.get("decoder_profile_model_id"),
         "encoder_profile_job_id":v.get("encoder_profile_job_id"),"decoder_profile_job_id":v.get("decoder_profile_job_id"),
         "profile_error":v.get("profile_error"),
     })
@@ -2182,4 +2336,4 @@ print("Profile cache:",PROFILE_PATH)
 print("\nFINAL ONE-FILE SUBMISSION BUNDLE:",BUNDLE_PATH)
 print("Contains final table + Qualcomm job IDs/URLs + exact S24 device evidence + hashes.")
 if RUN_MODE=="smoke":
-    print("Smoke passed. Set QAI_RUN_MODE=benchmark for the requested 100-sample benchmark.")
+    print("Smoke passed. Set QAI_RUN_MODE=benchmark for the requested 50-sample benchmark.")

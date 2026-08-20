@@ -13,6 +13,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "run_benchmark.py"
+COLAB_NOTEBOOK_PATH = ROOT / "QAI_S24_ASR_Benchmark_Colab.ipynb"
 
 
 def load_functions(*names: str, extra_globals: dict[str, Any] | None = None):
@@ -404,6 +405,8 @@ class CacheAndDependencyTests(unittest.TestCase):
             "_find_profile_metric",
             "_range_upper",
             "profile_metrics",
+            "_is_memory_allocation_error",
+            "_profile_runtime_option_candidates",
             "_run_profile_job_with_retries",
             extra_globals={"client": profile_client},
         )
@@ -421,6 +424,124 @@ class CacheAndDependencyTests(unittest.TestCase):
         self.assertIs(job, succeeded)
         self.assertEqual(metrics["latency_us"], 1234)
         self.assertEqual(metrics["inference_peak_memory_bytes"], 2048)
+
+    def test_profile_memory_failure_retries_with_maximum_vtcm(self):
+        mem_failed_status = SimpleNamespace(
+            success=False,
+            failure=True,
+            finished=True,
+            code="FAILED",
+            message="QNN_COMMON_ERROR_MEM_ALLOC: Memory allocation related error.",
+        )
+        failed = SimpleNamespace(
+            job_id="jp_profile_mem_failed",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_profile_mem_failed",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: mem_failed_status,
+        )
+        succeeded = SimpleNamespace(
+            job_id="jp_profile_vtcm_success",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_profile_vtcm_success",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            download_profile=lambda: {
+                "estimated_inference_time": 1234,
+                "inference_memory_peak_range": [1024, 2048],
+            },
+        )
+        jobs = iter([failed, succeeded])
+        submitted_options = []
+
+        def submit_profile_job(*args, **kwargs):
+            submitted_options.append(kwargs["options"])
+            return next(jobs)
+
+        profile_client = SimpleNamespace(
+            submit_profile_job=submit_profile_job,
+            get_job_summaries=lambda limit: [],
+        )
+        funcs = load_functions(
+            "_status_line",
+            "_find_profile_metric",
+            "_range_upper",
+            "profile_metrics",
+            "_is_memory_allocation_error",
+            "_profile_runtime_option_candidates",
+            "_run_profile_job_with_retries",
+            extra_globals={"client": profile_client},
+        )
+
+        job, _, _ = funcs["_run_profile_job_with_retries"](
+            profile_client,
+            SimpleNamespace(model_id="mm_model"),
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "profile_vtcm_retry_test",
+            "--compute_unit npu --qairt_version 2.49",
+            "Samsung Galaxy S24",
+            3,
+        )
+
+        self.assertIs(job, succeeded)
+        self.assertNotIn("default_graph_htp_vtcm_size", submitted_options[0])
+        self.assertIn("default_graph_htp_vtcm_size=0", submitted_options[1])
+
+    def test_profile_vtcm_retry_preserves_context_graph_selection(self):
+        funcs = load_functions("_profile_runtime_option_candidates")
+
+        candidates = funcs["_profile_runtime_option_candidates"](
+            "--compute_unit npu --qairt_version 2.49 "
+            "--qnn_options context_enable_graphs=whisper_small_encoder"
+        )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertIn("context_enable_graphs=whisper_small_encoder", candidates[1])
+        self.assertIn(";default_graph_htp_vtcm_size=0", candidates[1])
+
+    def test_single_graph_context_profile_fallback_compiles_and_links_one_component(self):
+        compiled_model = SimpleNamespace(model_id="mm_compiled", wait=lambda: True)
+        context_model = SimpleNamespace(model_id="mm_context", wait=lambda: True)
+        compile_job = SimpleNamespace(
+            job_id="jp_compile",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_compile",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            get_target_model=lambda: compiled_model,
+        )
+        link_job = SimpleNamespace(
+            job_id="jp_link",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_link",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            get_target_model=lambda: context_model,
+        )
+        submissions = []
+
+        def submit_compile_and_link_jobs(**kwargs):
+            submissions.append(kwargs)
+            return [compile_job], link_job
+
+        funcs = load_functions(
+            "_status_line",
+            "_link_retry_options",
+            "_retry_link_jobs",
+            "_compile_single_graph_profile_context",
+        )
+        model, evidence = funcs["_compile_single_graph_profile_context"](
+            SimpleNamespace(submit_compile_and_link_jobs=submit_compile_and_link_jobs),
+            SimpleNamespace(model_id="mm_source"),
+            {"input_features": ((1, 80, 3000), "float32")},
+            ["cross_cache"],
+            "whisper_small_encoder",
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "whisper_small_encoder_profile_fallback",
+            "2.49",
+        )
+
+        self.assertIs(model, context_model)
+        self.assertEqual(submissions[0]["models"][0].model_id, "mm_source")
+        self.assertEqual(submissions[0]["graph_names"], ["whisper_small_encoder"])
+        self.assertIn("--quantize_full_type float16", submissions[0]["compile_options"][0])
+        self.assertEqual(evidence["profile_model_id"], "mm_context")
 
     def test_profile_validation_rejects_missing_latency_or_peak_ram(self):
         funcs = load_functions("_validate_required_profile_rows")
@@ -478,12 +599,53 @@ class CacheAndDependencyTests(unittest.TestCase):
         self.assertIn('$env:QAI_ARTIFACT_POLICY = "separate_qnn_dlc"', setup)
         self.assertIn('$env:QAI_ENABLE_PROFILING = "1"', setup)
 
-    def test_default_run_keeps_100_samples_and_requires_s24_profiling(self):
+    def test_default_run_uses_50_samples_and_requires_s24_profiling(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
         self.assertRegex(source, r'QAI_RUN_MODE",\s*"benchmark"')
-        self.assertRegex(source, r'BENCHMARK_N\s*=\s*100')
+        self.assertRegex(source, r'BENCHMARK_N\s*=\s*50')
+        self.assertIn('VIMD_BENCHMARK_REGION_TARGETS = {"North": 17, "Central": 17, "South": 16}', source)
         self.assertRegex(source, r'QAI_ENABLE_PROFILING",\s*"1"')
         self.assertRegex(source, r'PROFILE_REQUIRED\s*=\s*True')
+
+    def test_microbatch_is_tunable_but_keeps_the_safe_default(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+        self.assertRegex(source, r'QAI_HUB_MICROBATCH",\s*"2"')
+
+    def test_colab_notebook_is_upload_and_run_ready(self):
+        self.assertTrue(COLAB_NOTEBOOK_PATH.exists())
+        notebook = json.loads(COLAB_NOTEBOOK_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(notebook["nbformat"], 4)
+        for index, cell in enumerate(notebook.get("cells", [])):
+            if cell.get("cell_type") == "code":
+                compile("".join(cell.get("source", [])), f"colab_cell_{index}", "exec")
+        all_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook.get("cells", [])
+        )
+
+        for required in (
+            "drive.mount",
+            "tanphong-sudo/qai_s24_benchmark.git",
+            "QAI_RUN_MODE",
+            "QAI_HUB_MICROBATCH",
+            "QAI_ENABLE_PROFILING",
+            "QAI_HF_HOME",
+            "QAI_DATA_ROOT",
+            "QAI_HUB_API_TOKEN",
+            "run_benchmark.py",
+            "QAI_S24_BENCHMARK_SUBMISSION.zip",
+            "hf_cache",
+            "checkpoints",
+        ):
+            self.assertIn(required, all_source)
+
+        self.assertIn('os.environ["QAI_HUB_MICROBATCH"] = "4"', all_source)
+        self.assertIn("'samples_per_benchmark': 50", all_source)
+        self.assertNotRegex(all_source, r'QAI_HUB_API_TOKEN\s*=\s*["\'][A-Za-z0-9_-]{20,}')
+
+    def test_colab_can_keep_large_download_caches_off_google_drive(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("QAI_HF_HOME"', source)
+        self.assertIn('os.environ.get("QAI_DATA_ROOT"', source)
 
 
 if __name__ == "__main__":

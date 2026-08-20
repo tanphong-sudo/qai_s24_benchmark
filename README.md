@@ -9,22 +9,25 @@ Yêu cầu: **Windows 10/11 64-bit**, Internet ổn định, **Python 3.11 64-bi
 4. Nếu chưa set `QAI_HUB_API_TOKEN`, chương trình sẽ hỏi token trong terminal. Token không được ghi vào output/evidence.
 5. Nếu Windows/Internet/Qualcomm queue làm run bị dừng, chạy lại `RUN_WINDOWS.bat`; checkpoint đã xong sẽ được reuse.
 
+## Google Colab
+Upload `QAI_S24_ASR_Benchmark_Colab.ipynb` lên Colab và chọn **Runtime > Run all**. Notebook dùng cùng `run_benchmark.py`, nhưng đặt microbatch 4 với adaptive fallback, dùng ổ local Colab cho Hugging Face/data cache và giữ artifact/checkpoint/kết quả trên Google Drive để resume sau khi runtime ngắt.
+
 ## Benchmark mặc định
-- FLEURS Vietnamese: **100** utterances.
-- FLEURS English: **100** utterances.
-- FLEURS Vietnamese noise @ 0 dB: **cùng 100 mẫu**, chạy paired clean/noisy.
-- ViMD: **100 tổng**, stratified North/Central/South = 34/33/33.
-- ViMedCSS test: **100** utterances.
+- FLEURS Vietnamese: **50** utterances.
+- FLEURS English: **50** utterances.
+- FLEURS Vietnamese noise @ 0 dB: **cùng 50 mẫu**, chạy paired clean/noisy.
+- ViMD: **50 tổng**, stratified North/Central/South = 17/17/16.
+- ViMedCSS test: **50** utterances.
 - Models: Whisper Tiny, Whisper Small, PhoWhisper Base.
 - Qualcomm microbatch: **2**, tự fallback 1 nếu payload 2 mẫu không phù hợp.
 - Encoder và decoder mặc định được compile thành **hai QNN DLC riêng**, nên lượt chạy không phụ thuộc vào context-binary link.
 - Mỗi inference job được tự retry tối đa **3 lần** nếu Qualcomm queue/job/download lỗi tạm thời.
-- Profile latency/RAM mặc định bật và là bắt buộc để điền cột speed / nặng không; profile job được retry tối đa 3 lần. Toàn bộ 100-sample prediction vẫn chạy trên S24 NPU.
+- Profile latency/RAM mặc định bật và là bắt buộc để điền cột speed / nặng không; profile job được retry tối đa 3 lần. Nếu QNN DLC profile thiếu RAM, runner thử VTCM tối đa rồi tạo một context binary chỉ chứa graph lỗi để profile. Toàn bộ 50-sample prediction vẫn dùng các QNN DLC riêng trên S24 NPU.
 
 ## Cái gì thực sự chạy trên S24?
 Windows PC chỉ download/preprocess audio, gọi API, greedy token selection/decode và tính WER/CER. **Mọi encoder/decoder neural forward pass dùng để tạo prediction được submit qua Qualcomm AI Hub Workbench tới exact hosted `Samsung Galaxy S24`, với NPU explicitly requested.** Script abort nếu Qualcomm trả về device khác.
 
-Thiết lập mặc định của `RUN_WINDOWS.bat` là `QAI_RUN_MODE=benchmark`, tức vẫn giữ đúng **100 mẫu cho mỗi benchmark**. Các QNN DLC và checkpoint đã hoàn thành được reuse khi chạy lại.
+Thiết lập mặc định của `RUN_WINDOWS.bat` là `QAI_RUN_MODE=benchmark`, tức chạy **50 mẫu cho mỗi benchmark**. Các QNN DLC và checkpoint đã hoàn thành được reuse khi chạy lại.
 
 ## Một file để nộp / upload Drive
 Sau khi chạy thành công, file cần upload là:
@@ -48,5 +51,6 @@ Toàn bộ QNN artifact cache, profile data và per-sample checkpoint nằm tron
 
 - Trước khi tạo Qualcomm job, launcher chạy `pip check`, syntax check và regression preflight.
 - Nếu artifact cũ có producer đã `FAILED`, script tự loại cache đó và compile lại QNN DLC thay vì dùng model hỏng.
+- Context binary fallback chỉ dùng để lấy latency/RAM cho component bị lỗi bộ nhớ; prediction và WER vẫn dùng QNN DLC encoder/decoder ban đầu. Artifact profile này được cache để lần chạy sau không compile lại.
 - Profile và inference job lỗi đều được thử lại tối đa 3 lần. Benchmark chỉ báo hoàn thành khi cả 3 model có đủ encoder latency, decoder latency/token và Peak RAM; nếu vẫn lỗi, console ghi status/URL và lần chạy sau tiếp tục dùng artifact/checkpoint đã hoàn thành.
 - Trước khi tạo ZIP, script kiểm tra toàn bộ ô VN/EN WER, Bắc/Trung/Nam WER, noise ΔWER, code-switch CS-WER, S24 latency và Peak RAM của cả 3 model; thiếu bất kỳ số nào thì không báo hoàn thành.
