@@ -17,7 +17,7 @@ if (-not $env:QAI_HUB_JOB_RETRIES) {
     $env:QAI_HUB_JOB_RETRIES = "3"
 }
 if (-not $env:QAI_ENABLE_PROFILING) {
-    $env:QAI_ENABLE_PROFILING = "0"
+    $env:QAI_ENABLE_PROFILING = "1"
 }
 
 if (-not $env:QAI_BENCHMARK_ROOT) {
@@ -195,8 +195,8 @@ Write-Host "  Device : exact hosted Samsung Galaxy S24"
 Write-Host "  Compute: Qualcomm NPU requested"
 Write-Host "  Samples: 100 per benchmark"
 Write-Host "  Artifact: separate QNN DLC encoder/decoder (no context link required)"
-Write-Host "  Retries: $env:QAI_HUB_JOB_RETRIES per inference job"
-Write-Host "  Profile: disabled (prediction benchmark only)"
+Write-Host "  Retries: $env:QAI_HUB_JOB_RETRIES per inference/profile job"
+Write-Host "  Profile: required S24 latency + Peak RAM"
 Write-Host ""
 Write-Host "If Qualcomm API token is not configured yet,"
 Write-Host "the benchmark will ask for it."
@@ -234,7 +234,7 @@ Write-Host "  - Qualcomm inference job IDs"
 Write-Host "  - Qualcomm job URLs"
 Write-Host "  - exact Samsung Galaxy S24 device evidence"
 Write-Host "  - sample selection"
-Write-Host "  - optional latency / memory profile fields"
+Write-Host "  - required S24 latency / Peak RAM profile fields"
 Write-Host "  - console log"
 Write-Host "  - SHA-256 hashes"
 Write-Host ""

@@ -362,6 +362,80 @@ class CacheAndDependencyTests(unittest.TestCase):
             )
         )
 
+    def test_profile_component_cache_requires_latency_and_memory(self):
+        funcs = load_functions("_profile_component_complete")
+        complete = funcs["_profile_component_complete"]
+
+        self.assertFalse(complete({"encoder_latency_us": 123}, "encoder"))
+        self.assertTrue(
+            complete(
+                {
+                    "encoder_latency_us": 123,
+                    "encoder_inference_peak_memory_bytes": 456,
+                },
+                "encoder",
+            )
+        )
+
+    def test_profile_job_retries_a_temporary_remote_failure(self):
+        failed = SimpleNamespace(
+            job_id="jp_profile_failed",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_profile_failed",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=False, code="FAILED"),
+        )
+        succeeded = SimpleNamespace(
+            job_id="jp_profile_success",
+            url="https://workbench.aihub.qualcomm.com/jobs/jp_profile_success",
+            device=SimpleNamespace(name="Samsung Galaxy S24"),
+            wait=lambda: FakeStatus(success=True, code="SUCCESS"),
+            download_profile=lambda: {
+                "estimated_inference_time": 1234,
+                "inference_memory_peak_range": [1024, 2048],
+            },
+        )
+        jobs = iter([failed, succeeded])
+        profile_client = SimpleNamespace(
+            submit_profile_job=lambda *args, **kwargs: next(jobs),
+            get_job_summaries=lambda limit: [],
+        )
+        funcs = load_functions(
+            "_status_line",
+            "_find_profile_metric",
+            "_range_upper",
+            "profile_metrics",
+            "_run_profile_job_with_retries",
+            extra_globals={"client": profile_client},
+        )
+
+        job, metrics, _ = funcs["_run_profile_job_with_retries"](
+            profile_client,
+            SimpleNamespace(model_id="mm_model"),
+            SimpleNamespace(name="Samsung Galaxy S24"),
+            "profile_retry_test",
+            "--compute_unit npu",
+            "Samsung Galaxy S24",
+            2,
+        )
+
+        self.assertIs(job, succeeded)
+        self.assertEqual(metrics["latency_us"], 1234)
+        self.assertEqual(metrics["inference_peak_memory_bytes"], 2048)
+
+    def test_profile_validation_rejects_missing_latency_or_peak_ram(self):
+        funcs = load_functions("_validate_required_profile_rows")
+        rows = [
+            {"model": "Whisper Tiny", "encoder_ms": 1.0, "decoder_ms_per_token": 2.0, "peak_ram_mb": 3.0},
+            {"model": "Whisper Small", "encoder_ms": 1.0, "decoder_ms_per_token": np.nan, "peak_ram_mb": 3.0},
+            {"model": "PhoWhisper Base", "encoder_ms": 1.0, "decoder_ms_per_token": 2.0, "peak_ram_mb": 3.0},
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "Whisper Small.*decoder_ms_per_token"):
+            funcs["_validate_required_profile_rows"](
+                rows,
+                ["Whisper Tiny", "Whisper Small", "PhoWhisper Base"],
+            )
+
     def test_corrupt_json_cache_is_quarantined(self):
         funcs = load_functions("_safe_json_load")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -383,13 +457,14 @@ class CacheAndDependencyTests(unittest.TestCase):
         self.assertIn("-m unittest discover -s tests -v", setup)
         self.assertIn('$env:QAI_RUN_MODE = "benchmark"', setup)
         self.assertIn('$env:QAI_ARTIFACT_POLICY = "separate_qnn_dlc"', setup)
-        self.assertIn('$env:QAI_ENABLE_PROFILING = "0"', setup)
+        self.assertIn('$env:QAI_ENABLE_PROFILING = "1"', setup)
 
-    def test_default_run_keeps_100_samples_and_skips_optional_profiling(self):
+    def test_default_run_keeps_100_samples_and_requires_s24_profiling(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
         self.assertRegex(source, r'QAI_RUN_MODE",\s*"benchmark"')
         self.assertRegex(source, r'BENCHMARK_N\s*=\s*100')
-        self.assertRegex(source, r'QAI_ENABLE_PROFILING",\s*"0"')
+        self.assertRegex(source, r'QAI_ENABLE_PROFILING",\s*"1"')
+        self.assertRegex(source, r'PROFILE_REQUIRED\s*=\s*True')
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-20-direct-dlc-retry-v5"
+PATCH_VERSION = "2026-08-20-required-s24-profile-v6"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = os.environ.get("QAI_RUN_MODE", "benchmark").strip().lower()
@@ -64,7 +64,7 @@ VIMEDCSS_INCLUDE_HARD = False
 HUB_MICROBATCH = 2
 HUB_JOB_RETRIES = max(1, int(os.environ.get("QAI_HUB_JOB_RETRIES", "3")))
 ARTIFACT_BUILD_POLICY = os.environ.get("QAI_ARTIFACT_POLICY", "separate_qnn_dlc").strip().lower()
-ENABLE_PROFILING = os.environ.get("QAI_ENABLE_PROFILING", "0").strip().lower() in {"1", "true", "yes"}
+ENABLE_PROFILING = os.environ.get("QAI_ENABLE_PROFILING", "1").strip().lower() in {"1", "true", "yes"}
 QAIRT_VERSION_REQUEST = "latest"
 TARGET_DEVICE_NAME = "Samsung Galaxy S24"  # exact hosted device, NEVER Family/Proxy fallback
 SR = 16_000
@@ -1022,7 +1022,7 @@ print("All optimized model artifacts have SUCCESS producers and are ready on the
 
 PROFILE_PATH=ARTIFACT_DIR/"s24_profiles.json"
 profile_cache=_safe_json_load(PROFILE_PATH,{})
-PROFILE_REQUIRED=False  # Main requirement is on-S24 dataset inference; profile failure must not block WER.
+PROFILE_REQUIRED=True
 
 def _profile_cache_needs_refresh(cached_profile, profile_key: str, required: list[str]) -> bool:
     if not cached_profile or cached_profile.get("profile_key") != profile_key:
@@ -1030,6 +1030,18 @@ def _profile_cache_needs_refresh(cached_profile, profile_key: str, required: lis
     if cached_profile.get("profile_error"):
         return True
     return any(cached_profile.get(key) is None for key in required)
+
+def _profile_component_complete(profile, component: str) -> bool:
+    if not profile or profile.get(f"{component}_latency_us") is None:
+        return False
+    return any(
+        profile.get(f"{component}_{metric}") is not None
+        for metric in (
+            "inference_peak_memory_bytes",
+            "first_load_peak_memory_bytes",
+            "warm_load_peak_memory_bytes",
+        )
+    )
 
 def _qnn_runtime_options(qairt_version: str, graph: str, artifact_mode: str | None) -> str:
     options=f"--compute_unit npu --qairt_version {qairt_version}"
@@ -1066,21 +1078,79 @@ def profile_metrics(job):
     if inf_mem is None: inf_mem=_range_upper(_find_profile_metric(report,"estimated_inference_peak_memory"))
     if first_mem is None: first_mem=_range_upper(_find_profile_metric(report,"first_load_peak_memory"))
     if warm_mem is None: warm_mem=_range_upper(_find_profile_metric(report,"warm_load_peak_memory"))
-    if latency is None:
+    if latency is None or inf_mem is None or first_mem is None or warm_mem is None:
         for s in client.get_job_summaries(limit=100):
-            if getattr(s,"job_id",None)==job.job_id and getattr(s,"estimated_inference_time",None) is not None:
+            if getattr(s,"job_id",None)!=job.job_id:
+                continue
+            if latency is None and getattr(s,"estimated_inference_time",None) is not None:
                 latency=int(s.estimated_inference_time)
-                if inf_mem is None:
-                    inf_mem=_range_upper(getattr(s,"inference_memory_peak_range",None))
-                break
+            if inf_mem is None:
+                inf_mem=_range_upper(getattr(s,"inference_memory_peak_range",None))
+            if first_mem is None:
+                first_mem=_range_upper(getattr(s,"first_load_memory_peak_range",None))
+            if warm_mem is None:
+                warm_mem=_range_upper(getattr(s,"warm_load_memory_peak_range",None))
+            break
     if latency is None:
         raise RuntimeError(f"Cannot find estimated_inference_time for {job.url}")
+    if inf_mem is None and first_mem is None and warm_mem is None:
+        raise RuntimeError(f"Cannot find peak memory metrics for {job.url}")
     return {
         "latency_us":int(latency),
         "inference_peak_memory_bytes":inf_mem,
         "first_load_peak_memory_bytes":first_mem,
         "warm_load_peak_memory_bytes":warm_mem,
     },report
+
+def _run_profile_job_with_retries(client_obj, model, device, name: str, options: str,
+                                  target_device_name: str, max_attempts: int):
+    failures=[]
+    for attempt in range(1,max_attempts+1):
+        job=None
+        try:
+            job=client_obj.submit_profile_job(
+                model,device=device,name=name,options=options
+            )
+            if getattr(getattr(job,"device",None),"name",None)!=target_device_name:
+                raise RuntimeError(
+                    f"Profile job {getattr(job,'url',None)} is not on exact "
+                    f"{target_device_name}: {getattr(job,'device',None)}"
+                )
+            metrics,report=profile_metrics(job)
+            print(
+                f"Profile {name} attempt {attempt}/{max_attempts}: SUCCESS | "
+                f"{getattr(job,'url',None)}"
+            )
+            return job,metrics,report
+        except Exception as exc:
+            detail=f"attempt {attempt}: job={getattr(job,'url',None)} error={exc!r}"
+            failures.append(detail)
+            if attempt<max_attempts:
+                print(f"WARNING: profile {name} failed; retrying. {detail}")
+    raise RuntimeError(
+        f"Profile {name} failed after {max_attempts} attempts. " + " | ".join(failures)
+    )
+
+def _validate_required_profile_rows(rows, required_models):
+    rows_by_model={row.get("model"):row for row in rows}
+    missing=[]
+    for model in required_models:
+        row=rows_by_model.get(model)
+        if row is None:
+            missing.append(f"{model}: profile row")
+            continue
+        for field in ("encoder_ms","decoder_ms_per_token","peak_ram_mb"):
+            value=row.get(field)
+            try:
+                valid=value is not None and bool(np.isfinite(float(value)))
+            except (TypeError,ValueError):
+                valid=False
+            if not valid:
+                missing.append(f"{model}: {field}")
+    if missing:
+        raise RuntimeError(
+            "Required S24 latency/RAM profiling is incomplete: " + "; ".join(missing)
+        )
 
 PROFILE_ROWS=[]
 for label,a in MODEL_ARTIFACTS.items():
@@ -1096,27 +1166,19 @@ for label,a in MODEL_ARTIFACTS.items():
               f"{DEVICE_FINGERPRINT}|{QAIRT_VERSION}|{QAIRT_FULL_VERSION}|profile-v3")
     cached_profile=profile_cache.get(label)
     required=["encoder_latency_us","decoder_latency_us"]
-    needs_refresh=_profile_cache_needs_refresh(cached_profile,pkey,required)
+    needs_refresh=(
+        _profile_cache_needs_refresh(cached_profile,pkey,required)
+        or any(
+            not _profile_component_complete(cached_profile,component)
+            for component in ("encoder","decoder")
+        )
+    )
     if needs_refresh and not ENABLE_PROFILING:
-        vals={
-            "profile_key":pkey,
-            "artifact_mode":artifact_mode,
-            "linked_model_id":a.get("linked_model_id"),
-            "encoder_model_id":encoder_model.model_id,
-            "decoder_model_id":decoder_model.model_id,
-            "profile_status":"disabled",
-            "profile_error":None,
-        }
-        for component in ("encoder","decoder"):
-            vals[f"{component}_latency_us"]=None
-            vals[f"{component}_profile_job_id"]=None
-            vals[f"{component}_profile_url"]=None
-            for key in ("inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"):
-                vals[f"{component}_{key}"]=None
-        profile_cache[label]=vals
-        atomic_json(profile_cache,PROFILE_PATH)
-    elif needs_refresh:
-        vals={
+        raise RuntimeError(
+            f"S24 latency/RAM profile is required for {label}, but QAI_ENABLE_PROFILING is disabled."
+        )
+    if needs_refresh:
+        base_vals={
             "profile_key":pkey,
             "artifact_mode":artifact_mode,
             "linked_model_id":a.get("linked_model_id"),
@@ -1124,14 +1186,19 @@ for label,a in MODEL_ARTIFACTS.items():
             "decoder_model_id":decoder_model.model_id,
             "profile_status":"requested",
         }
+        vals={**base_vals,**cached_profile} if cached_profile and cached_profile.get("profile_key")==pkey else base_vals
+        vals["profile_status"]="requested"
         profile_errors=[]
         for component,graph,model in [("encoder",enc_graph,encoder_model),("decoder",dec_graph,decoder_model)]:
+            if _profile_component_complete(vals,component):
+                print(f"Reusing completed S24 profile for {label}/{component}.")
+                continue
             try:
                 opts=_qnn_runtime_options(QAIRT_VERSION,graph,artifact_mode)
-                job=client.submit_profile_job(model,device=TARGET_DEVICE,name=f"{slug(label)}_{component}_s24",options=opts)
-                if getattr(getattr(job,"device",None),"name",None)!=TARGET_DEVICE_NAME:
-                    raise RuntimeError(f"Profile job {job.url} is not on exact {TARGET_DEVICE_NAME}: {getattr(job,'device',None)}")
-                metrics,report=profile_metrics(job)
+                job,metrics,report=_run_profile_job_with_retries(
+                    client,model,TARGET_DEVICE,f"{slug(label)}_{component}_s24",opts,
+                    TARGET_DEVICE_NAME,HUB_JOB_RETRIES
+                )
                 vals[f"{component}_profile_job_id"]=job.job_id
                 vals[f"{component}_profile_url"]=job.url
                 vals[f"{component}_latency_us"]=metrics["latency_us"]
@@ -1139,13 +1206,18 @@ for label,a in MODEL_ARTIFACTS.items():
                     if k!="latency_us": vals[f"{component}_{k}"]=v
             except Exception as exc:
                 profile_errors.append(f"{component}: {exc!r}")
-                print(f"WARNING: S24 profile failed for {label}/{component}; continuing to ASR inference because profiling is optional. {exc!r}")
+                print(f"ERROR: required S24 profile failed for {label}/{component}. {exc!r}")
                 vals[f"{component}_latency_us"]=None
                 vals[f"{component}_profile_job_id"]=None
                 vals[f"{component}_profile_url"]=None
                 for k in ["inference_peak_memory_bytes","first_load_peak_memory_bytes","warm_load_peak_memory_bytes"]:
                     vals[f"{component}_{k}"]=None
+                vals["profile_status"]="failed"
+                vals["profile_error"]=" | ".join(profile_errors)
+                profile_cache[label]=vals
+                atomic_json(profile_cache,PROFILE_PATH)
                 if PROFILE_REQUIRED: raise
+        vals["profile_status"]="success" if not profile_errors else "failed"
         vals["profile_error"]=" | ".join(profile_errors) if profile_errors else None
         profile_cache[label]=vals
         atomic_json(profile_cache,PROFILE_PATH)
@@ -1170,6 +1242,7 @@ for label,a in MODEL_ARTIFACTS.items():
         "profile_error":v.get("profile_error"),
     })
 PROFILE_DF=pd.DataFrame(PROFILE_ROWS)
+_validate_required_profile_rows(PROFILE_ROWS,list(MODEL_IDS))
 PROFILE_MAP=PROFILE_DF.set_index("model").to_dict("index")
 PROFILE_DF.to_csv(RESULT_DIR/"s24_model_speed_memory_profile.csv",index=False)
 display(PROFILE_DF)
