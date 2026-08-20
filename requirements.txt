@@ -1,0 +1,9 @@
+qai-hub-models[whisper-tiny,whisper-small]==0.57.0
+datasets>=3.6,<5
+huggingface_hub>=0.34
+jiwer>=3.0
+soundfile>=0.12
+scipy>=1.11
+pandas>=2.0
+pyarrow>=15
+tqdm>=4.66
