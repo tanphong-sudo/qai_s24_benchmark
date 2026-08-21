@@ -147,6 +147,25 @@ class InferenceStatusTests(unittest.TestCase):
         self.assertEqual(evidence[0]["status"], "success")
 
 
+class AudioCompatibilityTests(unittest.TestCase):
+    def test_datasets_audio_constructor_avoids_removed_mono_argument(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+
+        self.assertNotRegex(source, r"Audio\(sampling_rate=SR,\s*mono=")
+
+    def test_torchcodec_stereo_audio_is_downmixed_to_mono(self):
+        funcs = load_functions("_mono_audio_array", "audio_array")
+        stereo = np.asarray([[1.0, 3.0], [3.0, 5.0]], dtype=np.float32)
+        audio = SimpleNamespace(
+            get_all_samples=lambda: SimpleNamespace(data=stereo, sample_rate=16000)
+        )
+
+        waveform, sampling_rate = funcs["audio_array"](audio)
+
+        np.testing.assert_allclose(waveform, np.asarray([2.0, 4.0], dtype=np.float32))
+        self.assertEqual(sampling_rate, 16000)
+
+
 class CacheAndDependencyTests(unittest.TestCase):
     def test_direct_component_compile_jobs_target_qnn_dlc_without_linking(self):
         submissions = []
