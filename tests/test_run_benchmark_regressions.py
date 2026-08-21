@@ -1,5 +1,7 @@
 import ast
+import io
 import json
+import math
 import re
 import tempfile
 import time
@@ -154,7 +156,12 @@ class AudioCompatibilityTests(unittest.TestCase):
         self.assertNotRegex(source, r"Audio\(sampling_rate=SR,\s*mono=")
 
     def test_torchcodec_stereo_audio_is_downmixed_to_mono(self):
-        funcs = load_functions("_mono_audio_array", "audio_array")
+        funcs = load_functions(
+            "_mono_audio_array",
+            "_resample_audio",
+            "audio_array",
+            extra_globals={"SR": 16000},
+        )
         stereo = np.asarray([[1.0, 3.0], [3.0, 5.0]], dtype=np.float32)
         audio = SimpleNamespace(
             get_all_samples=lambda: SimpleNamespace(data=stereo, sample_rate=16000)
@@ -164,6 +171,45 @@ class AudioCompatibilityTests(unittest.TestCase):
 
         np.testing.assert_allclose(waveform, np.asarray([2.0, 4.0], dtype=np.float32))
         self.assertEqual(sampling_rate, 16000)
+
+    def test_datasets_audio_uses_decode_false_to_avoid_torchcodec(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+
+        casts = re.findall(r'cast_column\("audio",Audio\(decode=False\)\)', source)
+        self.assertEqual(len(casts), 3)
+        self.assertNotIn('Audio(sampling_rate=SR)', source)
+
+    def test_audio_bytes_are_decoded_resampled_and_downmixed_without_torchcodec(self):
+        stereo = np.column_stack(
+            [np.linspace(-0.5, 0.5, 80), np.linspace(0.5, -0.5, 80)]
+        ).astype(np.float32)
+
+        def fake_read(source, *, dtype, always_2d):
+            self.assertIsInstance(source, io.BytesIO)
+            self.assertEqual(dtype, "float32")
+            self.assertTrue(always_2d)
+            return stereo, 8000
+
+        funcs = load_functions(
+            "_mono_audio_array",
+            "_resample_audio",
+            "audio_array",
+            extra_globals={
+                "io": io,
+                "math": math,
+                "sf": SimpleNamespace(read=fake_read),
+                "resample_poly": lambda x, up, down: np.repeat(x, up // down),
+                "SR": 16000,
+            },
+        )
+
+        waveform, sampling_rate = funcs["audio_array"](
+            {"bytes": b"fake-wav", "path": None}
+        )
+
+        self.assertEqual(sampling_rate, 16000)
+        self.assertEqual(waveform.ndim, 1)
+        self.assertEqual(len(waveform), 160)
 
 
 class CacheAndDependencyTests(unittest.TestCase):

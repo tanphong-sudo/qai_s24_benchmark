@@ -3,7 +3,7 @@
 The laptop only orchestrates preprocessing/API calls; neural encoder/decoder inference runs on the hosted Samsung Galaxy S24 NPU.
 """
 
-import os, sys, re, gc, json, math, time, random, hashlib, shutil, zipfile, unicodedata, platform, inspect
+import os, sys, re, gc, io, json, math, time, random, hashlib, shutil, zipfile, unicodedata, platform, inspect
 from datetime import datetime, timezone
 import importlib.metadata as im
 from dataclasses import dataclass
@@ -42,7 +42,7 @@ from qai_hub_models.models._shared.hf_whisper.model import (
     SAMPLE_RATE,
 )
 
-PATCH_VERSION = "2026-08-21-datasets-audio-compat-v10"
+PATCH_VERSION = "2026-08-21-torchcodec-free-audio-v11"
 SEED = 42
 # Default is the requested fixed-size benchmark, NOT the huge full split.
 RUN_MODE = os.environ.get("QAI_RUN_MODE", "benchmark").strip().lower()
@@ -1662,16 +1662,33 @@ def _mono_audio_array(data):
             x=x.mean(axis=1,dtype=np.float32)
     return np.ascontiguousarray(x,dtype=np.float32)
 
+def _resample_audio(data, source_rate: int):
+    x=_mono_audio_array(data)
+    source_rate=int(source_rate)
+    if source_rate==SR:
+        return x,SR
+    divisor=math.gcd(source_rate,SR)
+    x=resample_poly(x,SR//divisor,source_rate//divisor)
+    return np.ascontiguousarray(x,dtype=np.float32),SR
+
 def audio_array(audio_obj):
     # Datasets <=3 dictionary Audio representation (the original notebooks' representation).
     if isinstance(audio_obj,dict) and "array" in audio_obj:
-        return _mono_audio_array(audio_obj["array"]),int(audio_obj["sampling_rate"])
+        return _resample_audio(audio_obj["array"],audio_obj["sampling_rate"])
+    # Audio(decode=False) avoids the datasets 4.x torchcodec dependency on Windows.
+    if isinstance(audio_obj,dict) and ("bytes" in audio_obj or "path" in audio_obj):
+        audio_bytes=audio_obj.get("bytes")
+        source=io.BytesIO(bytes(audio_bytes)) if audio_bytes is not None else audio_obj.get("path")
+        if source is None:
+            raise ValueError("Audio record has neither bytes nor path")
+        data,sr=sf.read(source,dtype="float32",always_2d=True)
+        return _resample_audio(data,sr)
     # Datasets 4.x torchcodec-backed AudioDecoder compatibility.
     if hasattr(audio_obj,"get_all_samples"):
         samples=audio_obj.get_all_samples()
         data=getattr(samples,"data",None); sr=getattr(samples,"sample_rate",None)
         if hasattr(data,"numpy"):data=data.numpy()
-        return _mono_audio_array(data),int(sr)
+        return _resample_audio(data,sr)
     raise TypeError(f"Unsupported datasets Audio object: {type(audio_obj)}")
 
 def validate_wave(x,sr):
@@ -1771,7 +1788,7 @@ def load_fleurs(locale:str,language_name:str,normalizer):
     if key in _FLEURS_CACHE:return _FLEURS_CACHE[key]
     rev=DATASET_REVISIONS["google/fleurs"]
     ds=load_dataset("google/fleurs",locale,split="test",revision=rev)
-    ds=ds.cast_column("audio",Audio(sampling_rate=SR))
+    ds=ds.cast_column("audio",Audio(decode=False))
     valid=[];excluded=[]
     limit=SMOKE_N if RUN_MODE=="smoke" else (BENCHMARK_N if RUN_MODE=="benchmark" else None)
     for idx,row in enumerate(tqdm(ds,desc=f"Validate FLEURS {locale}")):
@@ -1954,7 +1971,7 @@ if RUN["vimd_regional"]:
     if "set" in VIMD_DS.column_names:
         vals={str(x).strip().lower() for x in VIMD_DS.unique("set")}
         if vals!={"test"}:VIMD_DS=VIMD_DS.filter(lambda x:str(x["set"]).strip().lower()=="test")
-    VIMD_DS=VIMD_DS.cast_column("audio",Audio(sampling_rate=SR))
+    VIMD_DS=VIMD_DS.cast_column("audio",Audio(decode=False))
     rmap={"north":"North","central":"Central","south":"South"};valid=[];excluded=[];seen={x:0 for x in rmap.values()}
     if RUN_MODE=="smoke":
         region_targets={x:SMOKE_VIMD_PER_REGION for x in rmap.values()}
@@ -2017,7 +2034,7 @@ if RUN["vimedcss_codeswitch"]:
         ds=load_dataset(repo,split=split,revision=rev)
         needed={"segment_id","segment_text","cs_terms_list","audio"}
         if not needed.issubset(ds.column_names):raise RuntimeError(f"ViMedCSS {split} missing {needed-set(ds.column_names)}")
-        ds=ds.cast_column("audio",Audio(sampling_rate=SR))
+        ds=ds.cast_column("audio",Audio(decode=False))
         valid=[];excluded=[];limit=SMOKE_N if RUN_MODE=="smoke" else (BENCHMARK_N if RUN_MODE=="benchmark" else None)
         for idx,row in enumerate(tqdm(ds,desc=f"Validate ViMedCSS {split}")):
             sid=str(row["segment_id"])
